@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=XCA RS
+GenericName=Certificate Manager
+GenericName[ru]=Менеджер сертификатов
+Comment=Manage private keys, certificates, requests and revocation lists
+Comment[ru]=Управление ключами, сертификатами, запросами и списками отзыва
+Exec=xca-rs
+Icon=org.xca.rs
+Terminal=false
+Categories=Utility;Security;FileTools;
+StartupWMClass=org.xca.rs
+Keywords=certificate;key;pki;x509;ca;csr;crl;pkcs11;

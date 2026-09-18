@@ -1,0 +1,16 @@
+[package]
+name = "xca-rs"
+version = "0.1.0"
+edition = "2021"
+description = "XCA (X Certificate and Key Management) rewritten in Rust with GTK4 + libadwaita"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+openssl = { version = "0.10" }
+openssl-sys = "0.9"
+foreign-types = "0.3"
+cryptoki = "0.12"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+rust-i18n = "3"

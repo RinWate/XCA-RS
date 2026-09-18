@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Shield -->
+  <path d="M64 6 14 24v32c0 32 21 55 50 66 29-11 50-34 50-66V24Z" fill="#3584e4"/>
+  <path d="M64 14 22 30v26c0 28 18 48 42 58 24-10 42-30 42-58V30Z" fill="#1c71d8" opacity="0.35"/>
+  <!-- Key ring -->
+  <circle cx="50" cy="62" r="14" fill="none" stroke="#ffffff" stroke-width="9"/>
+  <!-- Key stem and teeth -->
+  <rect x="62" y="57" width="32" height="10" rx="2" fill="#ffffff"/>
+  <rect x="80" y="67" width="7" height="10" rx="1" fill="#ffffff"/>
+  <rect x="69" y="67" width="7" height="8" rx="1" fill="#ffffff"/>
+</svg>
