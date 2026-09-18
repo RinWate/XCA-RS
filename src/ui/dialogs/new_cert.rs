@@ -276,7 +276,6 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                                     _ => crypto::NewKeyKind::Rsa2048,
                                 };
                                 let key = crypto::generate_key(kind)?;
-                                let (k, bits, curve) = crypto::key_info(key.as_ref());
                                 let pem = key
                                     .private_key_to_pem_pkcs8()
                                     .map_err(|e| e.to_string())?;
@@ -286,7 +285,7 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                                 };
                                 let id = {
                                     let db = app2.db.lock().unwrap();
-                                    db.insert_key(&key_label, &k, bits, &curve, &pem)
+                                    db.insert_key(&key_label, &pem)
                                         .map_err(|e| e.to_string())?
                                 };
                                 let pub_only = crypto::public_of(key.as_ref())?;
@@ -349,7 +348,8 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                     .and_then(|p| cert.verify(p.as_ref()).ok()),
                 None => cert.verify(pubkey.as_ref()).ok(),
             };
-            if verified == Some(false) {
+            // A verification *error* must not pass as success either.
+            if verified != Some(true) {
                 return Err(tr!("Signature verification failed"));
             }
 
@@ -409,6 +409,9 @@ pub fn open_token(
     let email = entry(&tr!("E-Mail (emailAddress)"));
 
     let g_subj = form.group(&tr!("Token key “%{label}” (%{kind})", label = key.label.clone(), kind = key.kind.label()));
+    g_subj.set_description(Some(&tr!(
+        "Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token."
+    )));
     g_subj.add(&name_row);
     g_subj.add(&cn);
     g_subj.add(&org);

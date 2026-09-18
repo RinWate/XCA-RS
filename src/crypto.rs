@@ -10,7 +10,7 @@ use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
-use openssl::pkey::{HasPrivate, HasPublic, Id, PKey, PKeyRef, Private, Public};
+use openssl::pkey::{HasPrivate, HasPublic, Id, PKey, PKeyRef, Private};
 use openssl::rsa::Rsa;
 use openssl::stack::Stack;
 use openssl::x509::{
@@ -95,35 +95,9 @@ fn ec_key(curve: &str) -> CryptoResult<PKey<Private>> {
     PKey::from_ec_key(key).map_err(err)
 }
 
-/// (kind, size, curve) describing a key for display and storage.
-pub fn key_info<P: HasPrivate>(key: &PKeyRef<P>) -> (String, i32, String) {
-    match key.id() {
-        Id::RSA => match key.rsa() {
-            Ok(rsa) => ("RSA".into(), rsa.size() as i32 * 8, String::new()),
-            Err(_) => ("RSA".into(), 0, String::new()),
-        },
-        Id::EC => match key.ec_key() {
-            Ok(ec) => {
-                let curve = ec
-                    .group()
-                    .curve_name()
-                    .map(curve_label)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let bits = ec.group().degree() as i32;
-                ("EC".into(), bits, curve)
-            }
-            Err(_) => ("EC".into(), 0, String::new()),
-        },
-        Id::ED25519 => ("ED25519".into(), 256, "Ed25519".into()),
-        Id::ED448 => ("ED448".into(), 456, "Ed448".into()),
-        Id::X25519 => ("X25519".into(), 256, "X25519".into()),
-        other => (format!("{other:?}"), 0, String::new()),
-    }
-}
-
-/// Same as [`key_info`] for keys known only by their public part.
-pub fn public_key_info(key: &PKeyRef<Public>) -> (String, i32, String) {
+/// (kind, size, curve) describing a key for display and storage. Works
+/// for private and public-only keys alike — the private part is never used.
+pub fn key_info<P: HasPublic>(key: &PKeyRef<P>) -> (String, i32, String) {
     match key.id() {
         Id::RSA => match key.rsa() {
             Ok(rsa) => ("RSA".into(), rsa.size() as i32 * 8, String::new()),
@@ -156,13 +130,6 @@ pub fn curve_label(nid: Nid) -> &'static str {
         Nid::SECP521R1 => "P-521",
         _ => "unknown",
     }
-}
-
-/// Current time as the OpenSSL ASN1Time display string (used for bookkeeping).
-pub fn now_string() -> String {
-    Asn1Time::days_from_now(0)
-        .map(|t| t.to_string())
-        .unwrap_or_default()
 }
 
 /// Kind-only description for keys only known by their public part.
@@ -203,16 +170,11 @@ pub fn same_public_key<P: HasPublic, Q: HasPublic>(a: &PKeyRef<P>, b: &PKeyRef<Q
     }
 }
 
-/// Rebuild an X509Name (e.g. taken from a CSR) so it can be reused for a
-/// certificate.
+/// Deep-copy an X509Name (e.g. taken from a CSR) for reuse in a
+/// certificate. `to_owned` preserves the RDN value encodings; the former
+/// entry-by-entry rebuild mangled non-ASCII BMPString values.
 pub fn clone_name(name: &X509NameRef) -> CryptoResult<X509Name> {
-    let mut nb = X509NameBuilder::new().map_err(err)?;
-    for e in name.entries() {
-        let nid = e.object().nid();
-        let val = e.data().to_string().map_err(err)?;
-        nb.append_entry_by_nid(nid, &val).map_err(err)?;
-    }
-    Ok(nb.build())
+    name.to_owned().map_err(err)
 }
 
 pub fn load_cert(pem: &[u8]) -> CryptoResult<X509> {
@@ -250,11 +212,10 @@ pub fn name_to_string(name: &X509NameRef) -> String {
 
 pub fn cn_of_name(name: &X509NameRef) -> Option<String> {
     for e in name.entries() {
-        if let Ok(k) = e.object().nid().short_name() {
-            if k == "CN" {
+        if let Ok(k) = e.object().nid().short_name()
+            && k == "CN" {
                 return e.data().to_string().ok();
             }
-        }
     }
     None
 }
@@ -284,7 +245,7 @@ pub fn cert_summary(cert: &X509Ref) -> CertSummary {
         Some(Ok(d)) => d.days as i64,
         _ => 0,
     };
-    let is_ca = dump_cert(cert).contains("CA:TRUE");
+    let is_ca = unsafe { X509_check_ca(cert.as_ptr()) > 0 };
     CertSummary {
         subject: name_to_string(cert.subject_name()),
         issuer: name_to_string(cert.issuer_name()),
@@ -365,7 +326,6 @@ pub fn build_pkcs12(
     friendly_name: &str,
 ) -> CryptoResult<Vec<u8>> {
     let mut builder = Pkcs12::builder();
-    builder.name(friendly_name);
     if !chain.is_empty() {
         let mut stack = Stack::new().map_err(err)?;
         for c in chain {
@@ -498,7 +458,9 @@ pub fn cert_builder<P: HasPublic>(
     } else {
         add_ext(&mut b, issuer_cert, "basicConstraints", "CA:FALSE", true)?;
         let mut ku = vec!["digitalSignature"];
-        if params.server_auth {
+        // keyEncipherment is only meaningful for RSA key exchange;
+        // EC/EdDSA leafs sign with digitalSignature alone.
+        if params.server_auth && pubkey.id() == Id::RSA {
             ku.push("keyEncipherment");
         }
         add_ext(&mut b, issuer_cert, "keyUsage", &ku.join(","), true)?;
@@ -532,11 +494,13 @@ pub fn cert_builder<P: HasPublic>(
 unsafe extern "C" {
     fn i2d_re_X509_tbs(x: *const openssl_sys::X509, out: *mut *mut std::os::raw::c_uchar)
         -> std::os::raw::c_int;
+    /// >0 marks a CA certificate (several CA profiles); not bound in the
+    /// > openssl crate.
+    fn X509_check_ca(cert: *const openssl_sys::X509) -> std::os::raw::c_int;
 }
 
 /// The DER-encoded TBSCertificate part of a built (possibly unsigned) cert.
 pub fn cert_tbs_der(cert: &X509Ref) -> CryptoResult<Vec<u8>> {
-    use foreign_types::ForeignTypeRef;
     unsafe {
         let len = i2d_re_X509_tbs(cert.as_ptr(), std::ptr::null_mut());
         if len <= 0 {
@@ -655,19 +619,22 @@ fn ext_from_der(oid: &str, content: &[u8]) -> CryptoResult<X509Extension> {
 /// AuthorityKeyIdentifier extension from a raw key identifier.
 fn aki_extension_der(keyid: &[u8]) -> CryptoResult<X509Extension> {
     // AuthorityKeyIdentifier ::= SEQ( keyIdentifier [0] IMPLICIT OCTET STRING )
-    let mut inner = vec![0x80u8, keyid.len() as u8];
-    inner.extend_from_slice(keyid);
+    // der_tlv encodes the [0] length properly (the old `as u8` truncated
+    // for identifiers longer than 127 bytes).
+    let inner = der_tlv(0x80, keyid);
     let aki_value = der_tlv(0x30, &inner);
     ext_from_der("2.5.29.35", &aki_value)
 }
 
 /// Build a CRL for `ca_cert`, signed with `ca_key`, containing the given
-/// revoked serials (hex strings). Ed25519 CAs are not supported here yet.
+/// revoked serials (hex strings). `crl_number` must be monotonically
+/// increasing per CA (RFC 5280). Ed25519 CAs are not supported here yet.
 pub fn build_crl<K: HasPrivate>(
     ca_cert: &X509Ref,
     ca_key: &PKeyRef<K>,
     revoked_serials: &[String],
     validity_days: u32,
+    crl_number: i64,
 ) -> CryptoResult<openssl::x509::X509Crl> {
     use openssl::x509::{X509CrlBuilder, X509RevokedBuilder};
     if is_pure_eddsa(ca_key) {
@@ -680,14 +647,18 @@ pub fn build_crl<K: HasPrivate>(
     let nu = Asn1Time::days_from_now(validity_days).map_err(err)?;
     b.set_next_update(nu.as_ref()).map_err(err)?;
     // X509_CRL_sign insists on an Authority Key Identifier. The openssl
-    // crate exposes no CRL v3 context, so the extension is assembled as raw
-    // DER: keyid = SHA-1 of the issuer's public key (same as "keyid" derivation).
-    let keyid = ca_cert.digest(MessageDigest::sha1()).map_err(err)?;
+    // crate exposes no CRL v3 context, so the extension is assembled as
+    // raw DER. keyid must match the issuer's SKI: reuse it when present
+    // (the normal case), fall back to SHA-1 of the whole certificate.
+    let keyid: Vec<u8> = match ca_cert.subject_key_id() {
+        Some(ski) => ski.as_slice().to_vec(),
+        None => ca_cert.digest(MessageDigest::sha1()).map_err(err)?.to_vec(),
+    };
     let aki = aki_extension_der(&keyid)?;
     b.append_extension(aki).map_err(err)?;
     // CrlNumber ::= INTEGER — X509_CRL_sign requires the extension too.
-    let crl_number = ext_from_der("2.5.29.20", &der_tlv(0x02, &[1]))?;
-    b.append_extension(crl_number).map_err(err)?;
+    let crl_number_ext = ext_from_der("2.5.29.20", &der_int_be(&crl_number.to_be_bytes()))?;
+    b.append_extension(crl_number_ext).map_err(err)?;
     for hex in revoked_serials {
         let bn = openssl::bn::BigNum::from_hex_str(hex)
             .map_err(|e| format!("Bad revoked serial {hex}: {e}"))?;
@@ -699,7 +670,7 @@ pub fn build_crl<K: HasPrivate>(
         b.add_revoked(rb.build()).map_err(err)?;
     }
     b.sign(ca_key, MessageDigest::sha256()).map_err(err)?;
-    Ok(b.build().map_err(err)?)
+    b.build().map_err(err)
 }
 
 /// Build a certificate-signing request. Note: the openssl crate does not
@@ -715,7 +686,7 @@ pub fn build_request<K: HasPrivate>(subject: &X509Name, key: &PKeyRef<K>) -> Cry
 
 /// One recognized item from an imported file.
 pub enum Imported {
-    Key { key: PKey<Private>, name: String },
+    Key { key: PKey<Private> },
     Cert { cert: X509 },
     Req { req: X509Req },
     Pkcs12 {
@@ -759,25 +730,26 @@ fn import_password_cb(
 pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Imported>> {
     let text = String::from_utf8_lossy(data);
     let mut out = Vec::new();
-
+    // Independent passes, not an else-if chain: combo files that carry a
+    // certificate and its private key together must yield both.
     if text.contains("-----BEGIN CERTIFICATE-----") {
         match X509::stack_from_pem(data) {
             Ok(certs) => certs.into_iter().for_each(|c| out.push(Imported::Cert { cert: c })),
             Err(e) => return Err(format!("PEM certificate parse error: {e}")),
         }
-    } else if text.contains("CERTIFICATE REQUEST-----") {
+    }
+    if text.contains("CERTIFICATE REQUEST-----") {
         match X509Req::from_pem(data) {
             Ok(req) => out.push(Imported::Req { req }),
             Err(e) => return Err(format!("PEM request parse error: {e}")),
         }
-    } else if text.contains("PRIVATE KEY-----") {
+    }
+    if text.contains("PRIVATE KEY-----") {
         let key = PKey::private_key_from_pem_callback(data, import_password_cb(password))
             .map_err(|e| format!("Private key parse error: {e} (wrong password?)"))?;
-        out.push(Imported::Key {
-            key,
-            name: "Imported key".into(),
-        });
-    } else if looks_like_der(data) {
+        out.push(Imported::Key { key });
+    }
+    if out.is_empty() && looks_like_der(data) {
         if let Ok(cert) = X509::from_der(data) {
             out.push(Imported::Cert { cert });
         } else if let Ok(req) = X509Req::from_der(data) {
@@ -795,14 +767,12 @@ pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Import
                     .unwrap_or_default(),
             });
         } else if let Ok(key) = PKey::private_key_from_der(data) {
-            out.push(Imported::Key {
-                key,
-                name: "Imported key".into(),
-            });
+            out.push(Imported::Key { key });
         } else {
             return Err("Unrecognized file format".into());
         }
-    } else {
+    }
+    if out.is_empty() {
         return Err("Unrecognized file format".into());
     }
     Ok(out)
@@ -952,12 +922,14 @@ mod tests {
         )
         .unwrap();
 
-        let der = build_pkcs12(&cert, &key, &[ca.clone()], "secret-pw", "pfx-test").unwrap();
+        let der = build_pkcs12(&cert, &key, std::slice::from_ref(&ca), "secret-pw", "pfx-test").unwrap();
         let p12 = Pkcs12::from_der(&der).unwrap();
         let parsed = p12.parse2("secret-pw").unwrap();
-        assert!(parsed.cert.eq(&cert));
-        assert!(same_public_key(&parsed.pkey, &key));
-        let chain = parsed.chain.expect("CA chain in PFX");
+        // ParsedPkcs12_2 (openssl 0.10.8x): all fields are Options.
+        let got_cert = parsed.cert.expect("cert in PFX");
+        assert!(got_cert.eq(&cert));
+        assert!(same_public_key(parsed.pkey.as_ref().unwrap(), &key));
+        let chain = parsed.ca.expect("CA chain in PFX");
         assert_eq!(chain.len(), 1);
         for c in chain.iter() {
             assert!(c.eq(&ca));
@@ -1012,6 +984,30 @@ mod tests {
     }
 
     #[test]
+    fn combo_pem_yields_cert_and_key() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let name = subject("Combo").build_name().unwrap();
+        let cert = build_certificate(
+            &name,
+            &key,
+            &key,
+            None,
+            &CertParams {
+                validity_days: 30,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut combo = cert.to_pem().unwrap();
+        combo.extend_from_slice(&key.private_key_to_pem_pkcs8().unwrap());
+        let items = parse_any(&combo, None).unwrap();
+        assert_eq!(items.len(), 2, "cert + key from one file");
+        assert!(items.iter().any(|i| matches!(i, Imported::Cert { .. })));
+        assert!(items.iter().any(|i| matches!(i, Imported::Key { .. })));
+    }
+
+    #[test]
     fn crl_roundtrip() {
         let key = generate_key(NewKeyKind::Rsa2048).unwrap();
         let name = subject("CRL CA").build_name().unwrap();
@@ -1032,8 +1028,10 @@ mod tests {
             key.as_ref(),
             &["aabbcc".to_string(), "deadbeef".to_string()],
             30,
+            7,
         )
         .unwrap();
+        assert_eq!(crate::xca_format::crl_number(crl.as_ref()), 7);
         let pem = crl.to_pem().unwrap();
         let back = openssl::x509::X509Crl::from_pem(&pem).unwrap();
         assert_eq!(back.get_revoked().map(|s| s.len()).unwrap_or(0), 2);

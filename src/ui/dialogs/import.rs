@@ -77,16 +77,15 @@ pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {
     let db = app.db.lock().unwrap();
     for item in items {
         match item {
-            Imported::Key { key, name } => {
-                let (k, bits, curve) = crypto::key_info(key.as_ref());
+            Imported::Key { key } => {
+                let (k, bits, _) = crypto::key_info(key.as_ref());
                 let pem = key.private_key_to_pem_pkcs8().unwrap_or_default();
                 if db.key_exists(&pem).unwrap_or(false) {
                     n_dup += 1;
                     continue;
                 }
                 let label = format!("Imported {k} {bits}");
-                let _ = name;
-                if db.insert_key(&label, &k, bits, &curve, &pem).is_ok() {
+                if db.insert_key(&label, &pem).is_ok() {
                     n_keys += 1;
                 }
             }
@@ -139,11 +138,11 @@ pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {
             Imported::Pkcs12 { key, cert, ca } => {
                 let mut key_id = None;
                 if let Some(key) = key {
-                    let (k, bits, curve) = crypto::key_info(key.as_ref());
+                    let (k, bits, _) = crypto::key_info(key.as_ref());
                     let pem = key.private_key_to_pem_pkcs8().unwrap_or_default();
                     if !db.key_exists(&pem).unwrap_or(false) {
                         let label = format!("Imported {k} {bits}");
-                        if let Ok(id) = db.insert_key(&label, &k, bits, &curve, &pem) {
+                        if let Ok(id) = db.insert_key(&label, &pem) {
                             key_id = Some(id);
                             n_keys += 1;
                         }

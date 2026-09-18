@@ -32,7 +32,6 @@
 "Database" = "Database"
 "Open Database…" = "Open Database…"
 "New Database…" = "New Database…"
-"Encrypt Database…" = "Encrypt Database…"
 "About XCA RS" = "About XCA RS"
 
 # ---- database open / new ----
@@ -46,22 +45,14 @@
 
 # ---- password / encryption windows ----
 "Database Password" = "Database Password"
-"Protect the new database with a password.\nLeave empty to store it unencrypted." = "Protect the new database with a password.\nLeave empty to store it unencrypted."
 "Password" = "Password"
 "Repeat password" = "Repeat password"
-"Skip (unencrypted)" = "Skip (unencrypted)"
 "Continue" = "Continue"
 "Unlock Database" = "Unlock Database"
 "Wrong password, try again." = "Wrong password, try again."
 "The database is password-protected." = "The database is password-protected."
 "Unlock" = "Unlock"
-"The database is already encrypted" = "The database is already encrypted"
-"Encrypt Database" = "Encrypt Database"
-"SQLCipher Encryption" = "SQLCipher Encryption"
 "Encrypt" = "Encrypt"
-"Passwords are empty or do not match" = "Passwords are empty or do not match"
-"Database encrypted" = "Database encrypted"
-"The database file is now encrypted.\nQuit now and start xca-rs again." = "The database file is now encrypted.\nQuit now and start xca-rs again."
 "Quit" = "Quit"
 
 # ---- new key ----
@@ -248,3 +239,7 @@
 "Certificate Chain" = "Certificate Chain"
 "this certificate" = "this certificate"
 "Leave empty to export without a password." = "Leave empty to export without a password."
+"Export Private Key" = "Export Private Key"
+"Encryption" = "Encryption"
+"Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token." = "Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token."
+

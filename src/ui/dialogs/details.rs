@@ -99,8 +99,8 @@ pub fn open_cert(app: &App, rec: &CertRecord) {
     }
 
     // The chain up to the root, as linked in the database.
-    if let Ok(chain) = app.db.lock().unwrap().cert_chain(rec.id) {
-        if chain.len() > 1 {
+    if let Ok(chain) = app.db.lock().unwrap().cert_chain(rec.id)
+        && chain.len() > 1 {
             let gc = form.group(&tr!("Certificate Chain"));
             for c in &chain {
                 let title = if c.id == rec.id {
@@ -111,7 +111,6 @@ pub fn open_cert(app: &App, rec: &CertRecord) {
                 gc.add(&action_row(&title, &c.subject));
             }
         }
-    }
 
     let g2 = form.group(&tr!("OpenSSL Dump"));
     g2.add(&text_block(&crypto::dump_cert(cert.as_ref())));

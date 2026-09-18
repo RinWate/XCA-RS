@@ -32,7 +32,6 @@
 "Database" = "База данных"
 "Open Database…" = "Открыть базу данных…"
 "New Database…" = "Новая база данных…"
-"Encrypt Database…" = "Зашифровать базу данных…"
 "About XCA RS" = "О приложении XCA RS"
 
 # ---- database open / new ----
@@ -46,22 +45,14 @@
 
 # ---- password / encryption windows ----
 "Database Password" = "Пароль базы данных"
-"Protect the new database with a password.\nLeave empty to store it unencrypted." = "Защитите новую базу данных паролем.\nОставьте поле пустым, чтобы хранить её без шифрования."
 "Password" = "Пароль"
 "Repeat password" = "Повторите пароль"
-"Skip (unencrypted)" = "Пропустить (без шифрования)"
 "Continue" = "Продолжить"
 "Unlock Database" = "Разблокировка базы данных"
 "Wrong password, try again." = "Неверный пароль, попробуйте ещё раз."
 "The database is password-protected." = "База данных защищена паролем."
 "Unlock" = "Разблокировать"
-"The database is already encrypted" = "База данных уже зашифрована"
-"Encrypt Database" = "Шифрование базы данных"
-"SQLCipher Encryption" = "Шифрование SQLCipher"
 "Encrypt" = "Зашифровать"
-"Passwords are empty or do not match" = "Пароли пустые или не совпадают"
-"Database encrypted" = "База данных зашифрована"
-"The database file is now encrypted.\nQuit now and start xca-rs again." = "Файл базы данных теперь зашифрован.\nВыйдите из программы и запустите её заново."
 "Quit" = "Выйти"
 
 # ---- new key ----
@@ -248,3 +239,7 @@
 "Certificate Chain" = "Цепочка сертификатов"
 "this certificate" = "текущий сертификат"
 "Leave empty to export without a password." = "Оставьте пустым, чтобы экспортировать без пароля."
+"Export Private Key" = "Экспорт закрытого ключа"
+"Encryption" = "Шифрование"
+"Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token." = "Внимание: CA, созданный на токене, пока не может выпускать сертификаты и CRL из xca-rs — его закрытый ключ никогда не покидает токен."
+

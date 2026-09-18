@@ -31,8 +31,8 @@ pub fn open(app: &App) {
 
     let g_keys = form.group(&tr!("Token Keys"));
     let hint = adw::ActionRow::builder()
-        .title(&tr!("No session"))
-        .subtitle(&tr!("Connect to list the private keys on the token."))
+        .title(tr!("No session"))
+        .subtitle(tr!("Connect to list the private keys on the token."))
         .build();
     g_keys.add(&hint);
 
@@ -80,7 +80,7 @@ pub fn open(app: &App) {
         }
         if found.is_empty() {
             let none = adw::ActionRow::builder()
-                .title(&tr!("No private keys on this token"))
+                .title(tr!("No private keys on this token"))
                 .build();
             g_keys.add(&none);
         }
@@ -130,8 +130,11 @@ pub fn open(app: &App) {
             g_keys.add(&row);
         }
 
-        let status = tr!("Token “%{label}”, %{count} key(s)", label = token_label.clone(), count = keys_state.borrow().len() as i64);
-        let _ = status;
+        g_keys.set_title(&tr!(
+            "Token “%{label}”, %{count} key(s)",
+            label = token_label,
+            count = keys_state.borrow().len() as i64
+        ));
     });
 
     form.dlg.present(Some(&app.window));

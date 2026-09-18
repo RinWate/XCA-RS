@@ -88,9 +88,22 @@ fn database_path() -> PathBuf {
 
 fn main() {
     rust_i18n::set_locale(detect_locale());
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
     app.connect_activate(|app| {
         launch::start(app, database_path());
+    });
+    // `xca-rs file.xdb` (and "open with…" from the file manager) opens
+    // that database; xca-rs is single-window, so the current one closes.
+    app.connect_open(|app, files, _| {
+        if let Some(path) = files.first().and_then(|f| f.path()) {
+            for w in app.windows() {
+                w.close();
+            }
+            launch::start(app, path);
+        }
     });
     app.run();
 }

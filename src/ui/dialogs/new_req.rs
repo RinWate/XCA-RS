@@ -97,15 +97,19 @@ pub fn open(app: &App) {
                         _ => crypto::NewKeyKind::Rsa2048,
                     };
                     let key = crypto::generate_key(kind)?;
-                    let (k, bits, curve) = crypto::key_info(key.as_ref());
                     let pem = key
                         .private_key_to_pem_pkcs8()
                         .map_err(|e| e.to_string())?;
-                    let cn_label = subject.cn.clone();
+                    // Name the stored key like new_cert does: the typed
+                    // internal name, falling back to the CN.
+                    let key_label = if label.trim().is_empty() {
+                        subject.cn.clone()
+                    } else {
+                        label.trim().to_string()
+                    };
                     let id = {
                         let db = app2.db.lock().unwrap();
-                        db.insert_key(&cn_label, &k, bits, &curve, &pem)
-                            .map_err(|e| e.to_string())?
+                        db.insert_key(&key_label, &pem).map_err(|e| e.to_string())?
                     };
                     (key, Some(id))
                 }

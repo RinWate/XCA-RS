@@ -65,12 +65,11 @@ pub fn open(app: &App) {
 
         let result = (|| -> Result<(), String> {
             let key = crypto::generate_key(kind)?;
-            let (k, bits, curve) = crypto::key_info(key.as_ref());
             let pem = key
                 .private_key_to_pem_pkcs8()
                 .map_err(|e| format!("Encoding error: {e}"))?;
             let db = app2.db.lock().unwrap();
-            db.insert_key(&label, &k, bits, &curve, &pem)
+            db.insert_key(&label, &pem)
                 .map_err(|e| e.to_string())?;
             Ok(())
         })();

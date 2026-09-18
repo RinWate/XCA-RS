@@ -35,9 +35,36 @@ pub fn open_main(app: &adw::Application, path: &Path, password: Option<String>) 
         }
         Err(OpenError::Other(e)) => {
             eprintln!("Cannot open database at {}: {e}", path.display());
-            std::process::exit(1);
+            db_error_window(app, path, &e);
         }
     }
+}
+
+/// The database cannot be opened at all: show why in a small window
+/// instead of killing the process from inside a GTK callback.
+fn db_error_window(app: &adw::Application, path: &Path, msg: &str) {
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title(crate::tr!("Cannot open database"))
+        .default_width(440)
+        .build();
+    let tv = adw::ToolbarView::new();
+    tv.add_top_bar(&adw::HeaderBar::new());
+    use gtk::prelude::*;
+    use libadwaita::prelude::*;
+    let label = gtk::Label::new(Some(&format!(
+        "{}\n{}\n\n{msg}",
+        crate::tr!("Not an XCA database"),
+        path.display()
+    )));
+    label.set_wrap(true);
+    label.set_margin_top(24);
+    label.set_margin_bottom(24);
+    label.set_margin_start(24);
+    label.set_margin_end(24);
+    tv.set_content(Some(&label));
+    window.set_content(Some(&tv));
+    window.present();
 }
 
 pub fn start(app: &adw::Application, path: PathBuf) {

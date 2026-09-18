@@ -50,9 +50,7 @@ pub fn open(app: &App) {
             }
         };
         update(&ca_row);
-        let ca_row2 = ca_row.clone();
         ca_row.connect_notify_local(Some("selected"), move |row: &adw::ComboRow, _| update(row));
-        let _ = ca_row2;
     }
 
     let name_row = entry_default(&tr!("Internal Name"), "CRL");
@@ -104,11 +102,18 @@ pub fn open(app: &App) {
             };
             let ca_cert = crypto::load_cert(&ca_rec.pem)?;
             let ca_key = crypto::load_private_key(&key_rec.pem)?;
+            // RFC 5280: the CRL number must grow monotonically per CA;
+            // the counter lives in the XCA `authority` row.
+            let crl_no = {
+                let db = app2.db.lock().unwrap();
+                db.next_crl_number(ca_id).map_err(|e| e.to_string())?
+            };
             let crl = crypto::build_crl(
                 ca_cert.as_ref(),
                 ca_key.as_ref(),
                 &revoked,
                 validity.value() as u32,
+                crl_no,
             )?;
             let issuer = crypto::name_to_string(crl.issuer_name());
             let next_update = crl.next_update().map(|t| t.to_string()).unwrap_or_default();

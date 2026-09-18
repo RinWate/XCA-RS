@@ -23,7 +23,10 @@ pub struct App {
     pub pages: Rc<crate::ui::window::Pages>,
 }
 
-fn cert_badge(c: &CertRecord, revoked: &std::collections::HashSet<String>) -> String {
+fn cert_badge(
+    c: &CertRecord,
+    revoked: &std::collections::HashMap<i64, std::collections::HashSet<String>>,
+) -> String {
     let mut badge = match crypto::load_cert(&c.pem).map(|x| crypto::cert_summary(x.as_ref())) {
         Ok(s) => crypto::cert_status(&s),
         Err(_) => {
@@ -37,7 +40,9 @@ fn cert_badge(c: &CertRecord, revoked: &std::collections::HashSet<String>) -> St
             parts.join(" · ")
         }
     };
-    if revoked.contains(&c.serial) {
+    // Revocation is tracked per issuing CA; serials alone collide across CAs.
+    let ca = c.issuer_id.unwrap_or(c.id);
+    if revoked.get(&ca).is_some_and(|s| s.contains(&c.serial)) {
         badge = if badge.is_empty() {
             tr!("REVOKED")
         } else {
@@ -58,8 +63,8 @@ impl App {
         let certs = db.list_certs().unwrap_or_default();
         let reqs = db.list_reqs().unwrap_or_default();
         let crls = db.list_crls().unwrap_or_default();
-        let revoked: std::collections::HashSet<String> =
-            db.revoked_serials().unwrap_or_default().into_iter().collect();
+        let revoked: std::collections::HashMap<i64, std::collections::HashSet<String>> =
+            db.revoked_serials_by_ca().unwrap_or_default();
         drop(db);
 
         self.pages.keys.remove_all();
@@ -73,6 +78,8 @@ impl App {
         // row holds the certificates it issued, recursively. Roots are
         // self-signed certificates and those whose issuer is not in the
         // database; children are grouped by their direct issuer.
+        // Preserve the user's manual collapses across the rebuild.
+        let collapsed: std::collections::HashSet<i64> = self.pages.certs_tree_collapsed();
         self.pages.certs.remove_all();
         let ids: std::collections::HashSet<i64> = certs.iter().map(|c| c.id).collect();
         let parents: std::collections::HashMap<i64, i64> = certs
@@ -132,6 +139,7 @@ impl App {
                 self.pages.certs.append(obj);
             }
         }
+        self.pages.restore_certs_collapsed(&collapsed);
 
         self.pages.reqs.remove_all();
         for r in reqs {
@@ -223,6 +231,11 @@ impl App {
                 if path == app.db_path {
                     return app.toast(&tr!("This database is already open"));
                 }
+                // Verify before closing the current window: a broken file
+                // must not kill the running session.
+                if let Err(crate::db::OpenError::Other(e)) = crate::db::Db::open(&path, None) {
+                    return dialogs::error_dialog(&app.window, &e);
+                }
                 let Some(adw_app) = adw_app_of(&app) else { return };
                 app.window.close();
                 crate::launch::open_main(&adw_app, &path, None);
@@ -264,7 +277,7 @@ impl App {
             return self.toast(&tr!("Select a certificate first"));
         };
         let ca_id = c.issuer_id.unwrap_or(c.id);
-        let now = crypto::now_string();
+        let now = crate::xca_format::now_plain();
         let res = {
             let db = self.db.lock().unwrap();
             db.insert_revoked(&RevokedRecord {
@@ -390,7 +403,7 @@ impl App {
         adw::AboutDialog::builder()
             .application_name("XCA RS")
             .version(env!("CARGO_PKG_VERSION"))
-            .comments(&format!(
+            .comments(format!(
                 "{}\n\nE-mail: rinwate@yandex.ru",
                 tr!("Certificate and key management — a Rust rewrite of XCA using GTK4 and libadwaita")
             ))

@@ -14,6 +14,8 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 pub struct Pages {
+    /// The certificate tree model (kept for collapse-state save/restore).
+    certs_tree: gtk::TreeListModel,
     pub stack: adw::ViewStack,
     pub toast: adw::ToastOverlay,
     pub keys: gtk::gio::ListStore,
@@ -141,6 +143,49 @@ fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate
     )
 }
 
+impl Pages {
+    /// Ids of CA rows the user has collapsed (rows with children).
+    pub fn certs_tree_collapsed(&self) -> std::collections::HashSet<i64> {
+        let mut out = std::collections::HashSet::new();
+        for i in 0..self.certs_tree.n_items() {
+            let Ok(row) = self.certs_tree.item(i).unwrap().downcast::<gtk::TreeListRow>() else {
+                continue;
+            };
+            let Some(id) = row
+                .item()
+                .and_then(|o| o.downcast::<PkiItemObject>().ok())
+                .map(|o| o.id())
+            else {
+                continue;
+            };
+            if !row.is_expanded() {
+                out.insert(id);
+            }
+        }
+        out
+    }
+
+    /// Re-apply the collapsed set after a rebuild (new rows default to
+    /// expanded because of TreeListModel autoexpand).
+    pub fn restore_certs_collapsed(&self, collapsed: &std::collections::HashSet<i64>) {
+        for i in 0..self.certs_tree.n_items() {
+            let Ok(row) = self.certs_tree.item(i).unwrap().downcast::<gtk::TreeListRow>() else {
+                continue;
+            };
+            let Some(id) = row
+                .item()
+                .and_then(|o| o.downcast::<PkiItemObject>().ok())
+                .map(|o| o.id())
+            else {
+                continue;
+            };
+            if collapsed.contains(&id) {
+                row.set_expanded(false);
+            }
+        }
+    }
+}
+
 pub fn build(
     ui_app: &adw::Application,
     db: Rc<Mutex<Db>>,
@@ -191,7 +236,7 @@ pub fn build(
         },
     );
     let certs_sel =
-        gtk::SingleSelection::new(Some(certs_tree.upcast::<gtk::gio::ListModel>()));
+        gtk::SingleSelection::new(Some(certs_tree.clone().upcast::<gtk::gio::ListModel>()));
     let certs_menu = crate::ui::columns::RowMenuSlot::default();
     let certs_view = column_view(
         &certs_sel,
@@ -326,6 +371,7 @@ pub fn build(
             stack,
             toast: toast_overlay,
             keys: keys_store,
+            certs_tree,
             certs: certs_store,
             certs_children,
             reqs: reqs_store,
@@ -401,11 +447,9 @@ pub fn build(
             .keys
             .item(pos)
             .and_then(|o| o.downcast::<PkiItemObject>().ok())
-        {
-            if let Some(rec) = app2.db.lock().unwrap().get_key(obj.id()).ok().flatten() {
+            && let Some(rec) = app2.db.lock().unwrap().get_key(obj.id()).ok().flatten() {
                 crate::ui::dialogs::details::open_key(&app2, &rec);
             }
-        }
     });
     let app2 = app.clone();
     certs_view.connect_activate(move |_, pos| {
@@ -414,11 +458,9 @@ pub fn build(
             .certs
             .item(pos)
             .and_then(|o| o.downcast::<PkiItemObject>().ok())
-        {
-            if let Some(rec) = app2.db.lock().unwrap().get_cert(obj.id()).ok().flatten() {
+            && let Some(rec) = app2.db.lock().unwrap().get_cert(obj.id()).ok().flatten() {
                 crate::ui::dialogs::details::open_cert(&app2, &rec);
             }
-        }
     });
     let app2 = app.clone();
     reqs_view.connect_activate(move |_, pos| {
@@ -427,11 +469,9 @@ pub fn build(
             .reqs
             .item(pos)
             .and_then(|o| o.downcast::<PkiItemObject>().ok())
-        {
-            if let Some(rec) = app2.db.lock().unwrap().get_req(obj.id()).ok().flatten() {
+            && let Some(rec) = app2.db.lock().unwrap().get_req(obj.id()).ok().flatten() {
                 crate::ui::dialogs::details::open_req(&app2, &rec);
             }
-        }
     });
     let app2 = app.clone();
     crls_view.connect_activate(move |_, pos| {
@@ -440,11 +480,9 @@ pub fn build(
             .crls
             .item(pos)
             .and_then(|o| o.downcast::<PkiItemObject>().ok())
-        {
-            if let Some(rec) = app2.db.lock().unwrap().get_crl(obj.id()).ok().flatten() {
+            && let Some(rec) = app2.db.lock().unwrap().get_crl(obj.id()).ok().flatten() {
                 crate::ui::dialogs::details::open_crl(&app2, &rec);
             }
-        }
     });
 
     // ---- window actions + primary menu ----

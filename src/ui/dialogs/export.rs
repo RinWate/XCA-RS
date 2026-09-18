@@ -72,8 +72,62 @@ fn export_key(app: &App) {
     let Some(rec) = app.selected_key() else {
         return app.toast(&tr!("Select a key first"));
     };
-    app.toast(&tr!("Note: the key is exported unencrypted"));
-    write_file(app, rec.pem, format!("{}.key", sanitize(&rec.name)));
+    // Public-only keys go out as they are; private keys get an optional
+    // PEM password.
+    if crypto::load_private_key(&rec.pem).is_err() {
+        app.toast(&tr!("Note: the key is exported unencrypted"));
+        return write_file(app, rec.pem, format!("{}.key", sanitize(&rec.name)));
+    }
+
+    let form = form_dialog(&tr!("Export Private Key"), 400);
+    let pw1 = super::password_entry(&tr!("Password"));
+    let pw2 = super::password_entry(&tr!("Repeat password"));
+    let g = form.group(&tr!("Encryption"));
+    g.set_description(Some(&tr!("Leave empty to export without a password.")));
+    g.add(&pw1);
+    g.add(&pw2);
+
+    let cancel = form.close_button(&tr!("Cancel"));
+    let export = form.apply_button(&tr!("Export"));
+    {
+        let dlg = form.dlg.clone();
+        cancel.connect_clicked(move |_| {
+            dlg.close();
+        });
+    }
+
+    let app2 = app.clone();
+    let dlg = form.dlg.clone();
+    let rec = rec.clone();
+    let pw1 = pw1.clone();
+    let pw2 = pw2.clone();
+    export.connect_clicked(move |_| {
+        let a = row_text(&pw1);
+        if a != row_text(&pw2) {
+            return error_dialog(&app2.window, &tr!("Passwords do not match"));
+        }
+        let result = (|| -> Result<Vec<u8>, String> {
+            let key = crypto::load_private_key(&rec.pem)?;
+            if a.is_empty() {
+                key.private_key_to_pem_pkcs8().map_err(|e| e.to_string())
+            } else {
+                key.private_key_to_pem_pkcs8_passphrase(
+                    openssl::symm::Cipher::aes_256_cbc(),
+                    a.as_bytes(),
+                )
+                .map_err(|e| e.to_string())
+            }
+        })();
+        match result {
+            Ok(pem) => {
+                dlg.close();
+                write_file(&app2, pem, format!("{}.key", sanitize(&rec.name)));
+            }
+            Err(e) => error_dialog(&app2.window, &e),
+        }
+    });
+
+    form.dlg.present(Some(&app.window));
 }
 
 fn export_req(app: &App) {

@@ -111,6 +111,10 @@ pub struct Db {
     password: String,
     /// True when the file carries a `pwhash` (password-protected).
     pub has_password: bool,
+    /// Decrypted private-key PEM by key id. PBKDF2 decryption is not free
+    /// and every refresh lists all keys — cache the result for the
+    /// lifetime of the connection.
+    key_cache: std::cell::RefCell<std::collections::HashMap<i64, Vec<u8>>>,
 }
 
 fn s<T: std::fmt::Display>(e: T) -> String {
@@ -161,7 +165,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         if !fresh && !is_xca_schema(&conn)? {
-            return Err(OpenError::Other(tr!("Not an XCA database").into()));
+            return Err(OpenError::Other(tr!("Not an XCA database")));
         }
         conn.execute_batch(xf::SCHEMA)?;
 
@@ -192,6 +196,7 @@ impl Db {
             conn,
             password: password.unwrap_or("").to_string(),
             has_password,
+            key_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 
@@ -239,6 +244,7 @@ impl Db {
         tx.commit().map_err(s)?;
         self.password = new_password.to_string();
         self.has_password = !new_password.is_empty();
+        self.key_cache.borrow_mut().clear();
         Ok(())
     }
 
@@ -277,14 +283,7 @@ impl Db {
     /// Store a key. `pem` may be a private or a public key; private keys
     /// are PBES2-encrypted with the database password, exactly as the
     /// original XCA stores them.
-    pub fn insert_key(
-        &self,
-        name: &str,
-        _kind: &str,
-        _size: i32,
-        _curve: &str,
-        pem: &[u8],
-    ) -> Result<i64, String> {
+    pub fn insert_key(&self, name: &str, pem: &[u8]) -> Result<i64, String> {
         let private = crypto::load_private_key(pem).ok();
         let public = match &private {
             Some(k) => crypto::public_of(k.as_ref()).map_err(s)?,
@@ -292,7 +291,7 @@ impl Db {
                 format!("{}: {e}", tr!("Neither a private nor a public key"))
             })?,
         };
-        let (kind, bits, _curve) = crypto::public_key_info(public.as_ref());
+        let (kind, bits, _curve) = crypto::key_info(public.as_ref());
         let spki = public.public_key_to_der().map_err(s)?;
         let id = self.insert_item(name, xf::T_KEY, xf::SRC_GENERATED)?;
         self.conn
@@ -308,6 +307,7 @@ impl Db {
             )
             .map_err(s)?;
         if let Some(key) = private {
+            let plain = key.private_key_to_pem_pkcs8().map_err(s)?;
             let enc = key
                 .private_key_to_pkcs8_passphrase(aes256_cbc(), self.password.as_bytes())
                 .map_err(s)?;
@@ -317,31 +317,41 @@ impl Db {
                     params![id, xf::PT_COMMON, xf::b64_encode(&enc)],
                 )
                 .map_err(s)?;
+            self.key_cache.borrow_mut().insert(id, plain);
         }
         Ok(id)
     }
 
-    fn key_from_row(id: i64, name: String, public_b64: String, private_b64: Option<String>, own_pass: Option<i64>, password: &str) -> KeyRecord {
+    fn key_from_row(&self, id: i64, name: String, public_b64: String, private_b64: Option<String>, own_pass: Option<i64>) -> KeyRecord {
+        let password = self.password.clone();
+        let cached = private_b64.is_some().then(|| self.key_cache.borrow().get(&id).cloned()).flatten();
         let der = xf::b64_decode(&public_b64).unwrap_or_default();
         let public = PKey::public_key_from_der(&der).ok();
         let (kind, size, curve) = public
             .as_ref()
-            .map(|p| crypto::public_key_info(p.as_ref()))
+            .map(|p| crypto::key_info(p.as_ref()))
             .unwrap_or_default();
         // The private part: ptCommon keys decrypt with the database
         // password, ptBogus keys with the literal "Bogus".
-        let pw = match own_pass {
-            Some(xf::PT_COMMON) => Some(password),
+        let pw: Option<&str> = match own_pass {
+            Some(xf::PT_COMMON) => Some(password.as_str()),
             Some(xf::PT_BOGUS) => Some("Bogus"),
             _ => None,
         };
-        let pem = private_b64
-            .as_deref()
-            .and_then(xf::b64_decode)
-            .zip(pw)
-            .and_then(|(enc, pw)| PKey::private_key_from_pkcs8_passphrase(&enc, pw.as_bytes()).ok())
-            .and_then(|k| k.private_key_to_pem_pkcs8().ok())
-            .or_else(|| public.as_ref().and_then(|p| p.public_key_to_pem().ok()))
+        let pem = cached
+            .or_else(|| {
+                let pem = private_b64
+                    .as_deref()
+                    .and_then(xf::b64_decode)
+                    .zip(pw)
+                    .and_then(|(enc, pw)| {
+                        PKey::private_key_from_pkcs8_passphrase(&enc, pw.as_bytes()).ok()
+                    })
+                    .and_then(|k| k.private_key_to_pem_pkcs8().ok())
+                    .or_else(|| public.as_ref().and_then(|p| p.public_key_to_pem().ok()))?;
+                self.key_cache.borrow_mut().insert(id, pem.clone());
+                Some(pem)
+            })
             .unwrap_or_default();
         KeyRecord {
             id,
@@ -378,9 +388,8 @@ impl Db {
             .map_err(s)?
             .into_iter()
             .map(|(id, name, pubb, privb, ownp)| {
-                Self::key_from_row(id, name, pubb, privb, ownp, &self.password)
+                Ok::<_, String>(self.key_from_row(id, name, pubb, privb, ownp))
             })
-            .map(Ok)
             .collect()
     }
 
@@ -403,6 +412,7 @@ impl Db {
         ] {
             self.conn.execute(sql, params![id]).map_err(s)?;
         }
+        self.key_cache.borrow_mut().remove(&id);
         Ok(())
     }
 
@@ -457,12 +467,54 @@ impl Db {
                 ],
             )
             .map_err(s)?;
+        if sum.is_ca {
+            // The authority row carries the per-CA CRL counter, exactly
+            // as the original XCA stores it.
+            self.conn
+                .execute(
+                    "INSERT INTO authority(item, crlNo) VALUES (?1, 0)",
+                    params![id],
+                )
+                .map_err(s)?;
+        }
         Ok(id)
     }
 
+    /// Next CRL number for a CA (monotonically increasing, RFC 5280) and
+    /// the update that reserves it.
+    pub fn next_crl_number(&self, ca_id: i64) -> Result<i64, String> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT crlNo FROM authority WHERE item = ?1",
+                params![ca_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+            + 1;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE authority SET crlNo = ?1 WHERE item = ?2",
+                params![n, ca_id],
+            )
+            .map_err(s)?;
+        if changed == 0 {
+            self.conn
+                .execute(
+                    "INSERT INTO authority(item, crlNo) VALUES (?1, ?2)",
+                    params![ca_id, n],
+                )
+                .map_err(s)?;
+        }
+        Ok(n)
+    }
+
     fn cert_query<P: rusqlite::Params>(&self, tail: &str, p: P) -> Result<Vec<CertRecord>, String> {
+        // c.ca comes straight from the database — recomputing CA-ness via
+        // OpenSSL dumps on every refresh was both slow and fragile.
         let sql = format!(
-            "SELECT i.id, i.name, c.cert, c.issuer, x.pkey
+            "SELECT i.id, i.name, c.cert, c.issuer, x.pkey, c.ca
              FROM items i
              JOIN certs c ON c.item = i.id
              LEFT JOIN x509super x ON x.item = i.id
@@ -478,12 +530,13 @@ impl Db {
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<i64>>(3)?,
                     r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })
             .map_err(s)?;
         let mut out = Vec::new();
         for row in rows.collect::<Result<Vec<_>, _>>().map_err(s)? {
-            let (id, name, cert_b64, issuer_id, key_id) = row;
+            let (id, name, cert_b64, issuer_id, key_id, ca) = row;
             let Some(der) = xf::b64_decode(&cert_b64) else { continue };
             let Ok(cert) = X509::from_der(&der) else { continue };
             let sum = crypto::cert_summary(cert.as_ref());
@@ -495,7 +548,7 @@ impl Db {
                 serial: sum.serial,
                 not_after: sum.not_after,
                 expires_days: sum.expires_days,
-                ca: sum.is_ca,
+                ca: ca != 0,
                 key_id,
                 issuer_id,
                 pem: cert.to_pem().unwrap_or_default(),
@@ -811,11 +864,24 @@ impl Db {
             .collect()
     }
 
-    /// All revoked serials, for the status badges in the certificate list.
-    pub fn revoked_serials(&self) -> Result<Vec<String>, String> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT serial FROM revocations").map_err(s)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(s)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(s)
+    /// Revoked serials grouped by the issuing CA — the status badges must
+    /// match the pair (CA, serial): serials alone collide across CAs.
+    pub fn revoked_serials_by_ca(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, std::collections::HashSet<String>>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT caId, serial FROM revocations")
+            .map_err(s)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(s)?;
+        let mut map: std::collections::HashMap<i64, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for (ca, serial) in rows.collect::<Result<Vec<_>, _>>().map_err(s)? {
+            map.entry(ca).or_default().insert(serial);
+        }
+        Ok(map)
     }
 }
 
@@ -936,15 +1002,16 @@ fn migrate_old(path: &Path, password: Option<&str>) -> Result<Db, OpenError> {
 
     let mut key_ids = std::collections::HashMap::new();
     for OldKey(old, name, pem) in keys {
-        if let Ok(id) = db.insert_key(&name, "", 0, "", &pem) {
+        if let Ok(id) = db.insert_key(&name, &pem) {
             key_ids.insert(old, id);
         }
     }
     let mut cert_ids = std::collections::HashMap::new();
+    let mut links = Vec::new();
     for OldCert(old, name, pem, key_id, issuer_id) in certs {
         let rec = CertRecord {
             id: 0,
-            name: name.clone(),
+            name,
             subject: String::new(),
             issuer: String::new(),
             serial: String::new(),
@@ -953,13 +1020,17 @@ fn migrate_old(path: &Path, password: Option<&str>) -> Result<Db, OpenError> {
             ca: false,
             key_id: key_id.and_then(|k| key_ids.get(&k).copied()),
             issuer_id: None,
-            pem: pem.clone(),
+            pem,
         };
         if let Ok(id) = db.insert_cert(&rec) {
-            // issuer links are set once all certs exist
-            let _ = db.set_cert_refs(id, rec.key_id, issuer_id.and_then(|i| cert_ids.get(&i).copied()).or(None));
             cert_ids.insert(old, id);
+            links.push((id, rec.key_id, issuer_id));
         }
+    }
+    // Issuer links only make sense once every certificate exists — a cert
+    // inserted before its issuer would otherwise lose the reference.
+    for (id, key_id, issuer_id) in links {
+        let _ = db.set_cert_refs(id, key_id, issuer_id.and_then(|i| cert_ids.get(&i).copied()));
     }
     for OldReq(name, pem, key_id) in reqs {
         let rec = ReqRecord {
@@ -1062,7 +1133,7 @@ mod tests {
         {
             let db = Db::open(&path, Some("secret")).unwrap();
             assert!(db.has_password);
-            db.insert_key("k", "RSA", 2048, "", &key_pem).unwrap();
+            db.insert_key("k", &key_pem).unwrap();
         }
         // Missing and wrong passwords are rejected (pwhash check)…
         assert!(matches!(Db::open(&path, None), Err(OpenError::WrongPassword)));
@@ -1109,7 +1180,7 @@ mod tests {
         let db = Db::open(&tmpdir("keys").join("k.xdb"), None).unwrap();
         let key = crypto::generate_key(NewKeyKind::EcP256).unwrap();
         let pem = key.private_key_to_pem_pkcs8().unwrap();
-        let id = db.insert_key("k1", "EC", 256, "P-256", &pem).unwrap();
+        let id = db.insert_key("k1", &pem).unwrap();
         let keys = db.list_keys().unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].id, id);
@@ -1134,7 +1205,7 @@ mod tests {
         let db = Db::open(&tmpdir("certs").join("c.xdb"), None).unwrap();
         let (ca_key, ca, ca_pem) = ca_cert();
         let key_id = db
-            .insert_key("ca key", "RSA", 2048, "", &ca_key.private_key_to_pem_pkcs8().unwrap())
+            .insert_key("ca key", &ca_key.private_key_to_pem_pkcs8().unwrap())
             .unwrap();
         let ca_id = db.insert_cert(&ca_record(ca_pem)).unwrap();
         db.set_cert_refs(ca_id, Some(key_id), None).unwrap();
@@ -1217,10 +1288,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.list_revoked(ca_id).unwrap().len(), 1);
-        assert_eq!(db.revoked_serials().unwrap(), vec!["deadbeef".to_string()]);
+        assert!(db
+            .revoked_serials_by_ca()
+            .unwrap()
+            .get(&ca_id)
+            .is_some_and(|s| s.contains("deadbeef")));
         assert_eq!(db.list_revoked(ca_id).unwrap()[0].reason, "keyCompromise");
 
-        let crl_pem = crypto::build_crl(&ca, &ca_key, &[], 30)
+        let crl_pem = crypto::build_crl(&ca, &ca_key, &[], 30, 1)
             .unwrap()
             .to_pem()
             .unwrap();
@@ -1241,7 +1316,7 @@ mod tests {
         assert!(db.list_crls().unwrap().is_empty());
         // deleting the CA cascades revocation rows away
         db.delete_cert(ca_id).unwrap();
-        assert!(db.revoked_serials().unwrap().is_empty());
+        assert!(db.revoked_serials_by_ca().unwrap().is_empty());
     }
 
     /// The file xca-rs creates must be a faithful XCA database: same
@@ -1254,7 +1329,7 @@ mod tests {
         {
             let db = Db::open(&path, Some("pw")).unwrap();
             let key_pem = ca_key.private_key_to_pem_pkcs8().unwrap();
-            let key_id = db.insert_key("root key", "RSA", 2048, "", &key_pem).unwrap();
+            let key_id = db.insert_key("root key", &key_pem).unwrap();
             let cert_id = db.insert_cert(&ca_record(ca_pem)).unwrap();
             db.set_cert_refs(cert_id, Some(key_id), None).unwrap();
         }
@@ -1451,7 +1526,11 @@ mod tests {
         let certs = db.list_certs().unwrap();
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].name, "old ca");
-        assert_eq!(db.revoked_serials().unwrap(), vec!["aa".to_string()]);
+        assert!(db
+            .revoked_serials_by_ca()
+            .unwrap()
+            .values()
+            .any(|s| s.contains("aa")));
         assert_eq!(db.get_setting("pkcs11-module").as_deref(), Some("/lib/x.so"));
     }
 
@@ -1499,7 +1578,7 @@ mod tests {
                     db.list_certs().unwrap().len(),
                     db.list_reqs().unwrap().len(),
                     db.list_crls().unwrap().len(),
-                    db.revoked_serials().unwrap().len(),
+                    db.revoked_serials_by_ca().unwrap().values().map(|s| s.len()).sum::<usize>(),
                 );
                 assert!(path.with_file_name(format!(
                     "{}.old.bak",
@@ -1562,7 +1641,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.insert_key("probe key", "RSA", 2048, "", &key.private_key_to_pem_pkcs8().unwrap())
+        db.insert_key("probe key", &key.private_key_to_pem_pkcs8().unwrap())
             .unwrap();
         let ca_id = db
             .insert_cert(&CertRecord {

@@ -75,7 +75,7 @@ pub fn connect(module: &str, pin: &str) -> CryptoResult<Rc<Token>> {
         .ok_or("No token present in any slot")?;
     let slot_id = slot.id();
     let label = ctx
-        .get_token_info(slot.clone())
+        .get_token_info(slot)
         .map(|info| info.label().trim().to_string())
         .unwrap_or_else(|_| format!("slot {slot_id}"));
     let session = ctx
@@ -131,7 +131,7 @@ pub fn list_keys(token: &Token) -> CryptoResult<Vec<TokenKey>> {
             )
             .unwrap_or_default();
         let key_type = attrs.iter().find_map(|a| match a {
-            Attribute::KeyType(t) => Some(t.clone()),
+            Attribute::KeyType(t) => Some(*t),
             _ => None,
         });
         let spki = match key_type {
