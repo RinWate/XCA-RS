@@ -6,8 +6,8 @@ use super::{form_dialog, row_text};
 use crate::app::App;
 use crate::tr;
 use gtk::prelude::*;
-use libadwaita::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -153,6 +153,11 @@ fn append_row(
 pub fn open_edit(app: &App, initial: Vec<SanEntry>, on_apply: impl Fn(Vec<SanEntry>) + 'static) {
     let form = form_dialog(&tr!("SAN Editor"), 460);
     let group = form.group(&tr!("Subject Alt Names"));
+    // height_request is a minimum, not a clamp: the dialog opens tall
+    // enough for three entry rows and still grows when rows are added.
+    // (set_content_height must not be used here — it pins the size and
+    // the extra rows end up hidden in the scroll area.)
+    group.set_height_request(3 * 54 + 40);
     let model = gtk::StringList::new(&[
         SanKind::Dns.label(),
         SanKind::Ip.label(),
@@ -239,8 +244,14 @@ mod tests {
     #[test]
     fn summary_lists_raw_entries() {
         let entries = vec![
-            SanEntry { kind: SanKind::Dns, value: "a.example".into() },
-            SanEntry { kind: SanKind::Ip, value: "10.0.0.1".into() },
+            SanEntry {
+                kind: SanKind::Dns,
+                value: "a.example".into(),
+            },
+            SanEntry {
+                kind: SanKind::Ip,
+                value: "10.0.0.1".into(),
+            },
         ];
         assert_eq!(summary(&entries), "DNS:a.example, IP:10.0.0.1");
     }

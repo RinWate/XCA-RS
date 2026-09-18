@@ -17,8 +17,8 @@ use std::sync::Mutex;
 pub struct App {
     pub db: Rc<Mutex<Db>>,
     pub db_path: PathBuf,
-    /// True when the database was opened with a password (SQLCipher).
-    pub encrypted: bool,
+    /// True when the database is password-protected (XCA `pwhash`).
+    pub password_protected: bool,
     pub window: adw::ApplicationWindow,
     pub pages: Rc<crate::ui::window::Pages>,
 }
@@ -69,12 +69,68 @@ impl App {
                 .append(&PkiItemObject::new(k.id, &k.name, &k.type_label(), "", ""));
         }
 
+        // The certificate page is a tree like the original XCA's: a CA
+        // row holds the certificates it issued, recursively. Roots are
+        // self-signed certificates and those whose issuer is not in the
+        // database; children are grouped by their direct issuer.
         self.pages.certs.remove_all();
-        for c in certs {
-            let badge = cert_badge(&c, &revoked);
-            self.pages
-                .certs
-                .append(&PkiItemObject::new(c.id, &c.name, &c.subject, &c.issuer, &badge));
+        let ids: std::collections::HashSet<i64> = certs.iter().map(|c| c.id).collect();
+        let parents: std::collections::HashMap<i64, i64> = certs
+            .iter()
+            .filter_map(|c| {
+                c.issuer_id
+                    .filter(|i| *i != c.id && ids.contains(i))
+                    .map(|i| (c.id, i))
+            })
+            .collect();
+        let mut roots = Vec::new();
+        let mut children_ids: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+        for c in &certs {
+            // Walk up to find a root; a runaway walk means an issuer
+            // cycle — cut it by making this certificate a root.
+            let mut cur = c.id;
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                if steps > 100 {
+                    cur = c.id;
+                    break;
+                }
+                match parents.get(&cur) {
+                    Some(p) => cur = *p,
+                    None => break,
+                }
+            }
+            if cur == c.id {
+                roots.push(c.id);
+            } else if let Some(p) = parents.get(&c.id) {
+                children_ids.entry(*p).or_default().push(c.id);
+            }
+        }
+        let mut objects = std::collections::HashMap::new();
+        for c in &certs {
+            let badge = cert_badge(c, &revoked);
+            objects.insert(
+                c.id,
+                PkiItemObject::new(c.id, &c.name, &c.subject, &c.issuer, &badge),
+            );
+        }
+        *self.pages.certs_children.borrow_mut() = children_ids
+            .iter()
+            .map(|(parent, kids)| {
+                let store = gtk::gio::ListStore::new::<PkiItemObject>();
+                for id in kids {
+                    if let Some(obj) = objects.get(id) {
+                        store.append(obj);
+                    }
+                }
+                (*parent, store)
+            })
+            .collect();
+        for id in roots {
+            if let Some(obj) = objects.get(&id) {
+                self.pages.certs.append(obj);
+            }
         }
 
         self.pages.reqs.remove_all();
@@ -146,8 +202,8 @@ impl App {
         dialogs::token::open(self);
     }
 
-    pub fn encrypt_database_dialog(&self) {
-        dialogs::password::encrypt_database(self);
+    pub fn password_dialog(&self) {
+        dialogs::password::set_or_change(self);
     }
 
     /// Close the current window and open another database file (asks for
@@ -155,7 +211,7 @@ impl App {
     pub fn open_database(&self) {
         let dlg = gtk::FileDialog::builder()
             .title(tr!("Open Database"))
-            .filters(&db_file_filters())
+            .filters(&dialogs::db_file_filters())
             .build();
         let app = self.clone();
         dlg.open(
@@ -178,9 +234,9 @@ impl App {
     pub fn new_database(&self) {
         let dlg = gtk::FileDialog::builder()
             .title(tr!("New Database"))
-            .filters(&db_file_filters())
+            .filters(&dialogs::db_file_filters())
             .accept_label(tr!("Create"))
-            .initial_name("xca-rs.db")
+            .initial_name("xca-rs.xdb")
             .build();
         let app = self.clone();
         dlg.save(
@@ -304,7 +360,7 @@ impl App {
         dlg.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         let app = self.clone();
         dlg.choose(
-            &self.window,
+            Some(&self.window),
             None::<&gtk::gio::Cancellable>,
             move |resp| {
                 if resp.as_str() != "delete" {
@@ -347,19 +403,6 @@ impl App {
             .build()
             .present(Some(&self.window));
     }
-}
-
-fn db_file_filters() -> gtk::gio::ListStore {
-    let dbf = gtk::FileFilter::new();
-    dbf.set_name(Some(&tr!("XCA databases")));
-    dbf.add_pattern("*.db");
-    let all = gtk::FileFilter::new();
-    all.set_name(Some(&tr!("All files")));
-    all.add_pattern("*");
-    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-    filters.append(&dbf);
-    filters.append(&all);
-    filters
 }
 
 fn adw_app_of(app: &App) -> Option<adw::Application> {

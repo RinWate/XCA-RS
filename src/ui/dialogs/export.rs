@@ -183,6 +183,7 @@ fn pfx_export(app: &App, rec: &CertRecord, with_chain: bool) {
     let pw1 = super::password_entry(&tr!("Password"));
     let pw2 = super::password_entry(&tr!("Repeat password"));
     let g = form.group(&tr!("PKCS#12"));
+    g.set_description(Some(&tr!("Leave empty to export without a password.")));
     g.add(&pw1);
     g.add(&pw2);
 
@@ -200,8 +201,9 @@ fn pfx_export(app: &App, rec: &CertRecord, with_chain: bool) {
     let pw2 = pw2.clone();
     export.connect_clicked(move |_| {
         let a = row_text(&pw1);
-        if a.is_empty() || a != row_text(&pw2) {
-            return error_dialog(&app2.window, &tr!("Passwords are empty or do not match"));
+        // An empty password is allowed (unencrypted PFX); a mismatch is not.
+        if a != row_text(&pw2) {
+            return error_dialog(&app2.window, &tr!("Passwords do not match"));
         }
         let result = (|| -> Result<Vec<u8>, String> {
             let cert = crypto::load_cert(&rec.pem)?;

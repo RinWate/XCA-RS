@@ -10,7 +10,7 @@ use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
-use openssl::pkey::{HasPrivate, HasPublic, Id, PKey, PKeyRef, Private};
+use openssl::pkey::{HasPrivate, HasPublic, Id, PKey, PKeyRef, Private, Public};
 use openssl::rsa::Rsa;
 use openssl::stack::Stack;
 use openssl::x509::{
@@ -97,6 +97,33 @@ fn ec_key(curve: &str) -> CryptoResult<PKey<Private>> {
 
 /// (kind, size, curve) describing a key for display and storage.
 pub fn key_info<P: HasPrivate>(key: &PKeyRef<P>) -> (String, i32, String) {
+    match key.id() {
+        Id::RSA => match key.rsa() {
+            Ok(rsa) => ("RSA".into(), rsa.size() as i32 * 8, String::new()),
+            Err(_) => ("RSA".into(), 0, String::new()),
+        },
+        Id::EC => match key.ec_key() {
+            Ok(ec) => {
+                let curve = ec
+                    .group()
+                    .curve_name()
+                    .map(curve_label)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let bits = ec.group().degree() as i32;
+                ("EC".into(), bits, curve)
+            }
+            Err(_) => ("EC".into(), 0, String::new()),
+        },
+        Id::ED25519 => ("ED25519".into(), 256, "Ed25519".into()),
+        Id::ED448 => ("ED448".into(), 456, "Ed448".into()),
+        Id::X25519 => ("X25519".into(), 256, "X25519".into()),
+        other => (format!("{other:?}"), 0, String::new()),
+    }
+}
+
+/// Same as [`key_info`] for keys known only by their public part.
+pub fn public_key_info(key: &PKeyRef<Public>) -> (String, i32, String) {
     match key.id() {
         Id::RSA => match key.rsa() {
             Ok(rsa) => ("RSA".into(), rsa.size() as i32 * 8, String::new()),
@@ -502,7 +529,7 @@ pub fn cert_builder<P: HasPublic>(
 
 // ---- low-level DER helpers for external (token) signature assembly ----
 
-extern "C" {
+unsafe extern "C" {
     fn i2d_re_X509_tbs(x: *const openssl_sys::X509, out: *mut *mut std::os::raw::c_uchar)
         -> std::os::raw::c_int;
 }
@@ -927,7 +954,7 @@ mod tests {
 
         let der = build_pkcs12(&cert, &key, &[ca.clone()], "secret-pw", "pfx-test").unwrap();
         let p12 = Pkcs12::from_der(&der).unwrap();
-        let parsed = p12.parse("secret-pw").unwrap();
+        let parsed = p12.parse2("secret-pw").unwrap();
         assert!(parsed.cert.eq(&cert));
         assert!(same_public_key(&parsed.pkey, &key));
         let chain = parsed.chain.expect("CA chain in PFX");
@@ -936,7 +963,7 @@ mod tests {
             assert!(c.eq(&ca));
         }
         // Wrong password must not open the bundle.
-        assert!(p12.parse("wrong").is_err());
+        assert!(p12.parse2("wrong").is_err());
     }
 
     #[test]

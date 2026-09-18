@@ -22,9 +22,14 @@ signing requests, revocation), restated as a native GNOME app.
 - **Import**: PEM and DER files with certificates, requests and private keys;
   PKCS#12 bundles with password prompt; duplicate detection.
 - **Details view**: parsed fields plus the full OpenSSL text dump.
-- **Encrypted storage**: the database is SQLCipher (AES) — set a password on
-  first run, or encrypt an existing database later via the menu; unlock
-  prompt on start.
+- **Native XCA database format**: xca-rs reads and writes the same `.xdb`
+  SQLite database as the original XCA — open your existing XCA database
+  directly and keep using it in both programs. Private keys are stored
+  PKCS#8-encrypted (PBES2/AES) with the database password (`pwhash`
+  scheme); set or change the password via the menu, unlock prompt on
+  start. Databases of the earlier xca-rs-specific format (SQLCipher) are
+  migrated automatically on first open (the original is kept as
+  `*.old.bak`).
 - **PKCS#11 hardware tokens** (via the `cryptoki` crate): connect to a module,
   list token keys, and create a CA whose private key never leaves the token
   (TBS is signed on the token with CKM_SHA256_RSA_PKCS / pure EdDSA, the
@@ -68,14 +73,14 @@ yet (see the original C++ code for reference):
 ## Build and run
 
 Dependencies (Arch names): `rust`, `gtk4`, `libadwaita`, `openssl`, plus a C
-compiler for the bundled SQLCipher.
+compiler for the bundled SQLite/SQLCipher amalgamation.
 
 ```sh
 cargo run --release
 ```
 
-Tests (crypto round-trips, CRL building, DER assembly, PKCS#12, encrypted
-storage):
+Tests (crypto round-trips, CRL building, DER assembly, PKCS#12, XCA-format
+storage and interop, migration):
 
 ```sh
 cargo test

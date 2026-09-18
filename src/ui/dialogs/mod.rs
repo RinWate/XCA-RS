@@ -22,6 +22,22 @@ pub fn error_dialog(parent: &adw::ApplicationWindow, msg: &str) {
     d.present(Some(parent));
 }
 
+/// File filters for database pickers: the original XCA's `.xdb` (native
+/// format) and the generic `.db`.
+pub fn db_file_filters() -> gtk::gio::ListStore {
+    let dbf = gtk::FileFilter::new();
+    dbf.set_name(Some(&crate::tr!("XCA databases")));
+    dbf.add_pattern("*.xdb");
+    dbf.add_pattern("*.db");
+    let all = gtk::FileFilter::new();
+    all.set_name(Some(&crate::tr!("All files")));
+    all.add_pattern("*");
+    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&dbf);
+    filters.append(&all);
+    filters
+}
+
 /// EntryRow/PasswordEntryRow expose no text getters in libadwaita-rs 0.7,
 /// so read the property directly.
 pub fn row_text<R: glib::object::IsA<glib::Object>>(row: &R) -> String {

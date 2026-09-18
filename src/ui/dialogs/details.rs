@@ -60,6 +60,59 @@ pub fn open_cert(app: &App, rec: &CertRecord) {
     g.add(&action_row(&tr!("Validity"), &expiry));
     g.add(&action_row(&tr!("Status"), &crypto::cert_status(&s)));
 
+    // Subject Alt Names, one row per entry (same prefixes as the SAN editor).
+    if let Some(sans) = cert.subject_alt_names() {
+        let mut rows: Vec<(&str, String)> = Vec::new();
+        for name in sans.iter() {
+            if let Some(d) = name.dnsname() {
+                rows.push(("DNS", d.to_string()));
+            }
+            if let Some(ip) = name.ipaddress() {
+                let text = match ip.len() {
+                    4 => std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
+                    16 => {
+                        let mut b = [0u8; 16];
+                        b.copy_from_slice(ip);
+                        std::net::Ipv6Addr::from(b).to_string()
+                    }
+                    _ => ip
+                        .iter()
+                        .map(|x| format!("{x:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                };
+                rows.push(("IP", text));
+            }
+            if let Some(e) = name.email() {
+                rows.push(("email", e.to_string()));
+            }
+            if let Some(u) = name.uri() {
+                rows.push(("URI", u.to_string()));
+            }
+        }
+        if !rows.is_empty() {
+            let gs = form.group(&tr!("Subject Alt Names"));
+            for (kind, value) in rows {
+                gs.add(&action_row(kind, &value));
+            }
+        }
+    }
+
+    // The chain up to the root, as linked in the database.
+    if let Ok(chain) = app.db.lock().unwrap().cert_chain(rec.id) {
+        if chain.len() > 1 {
+            let gc = form.group(&tr!("Certificate Chain"));
+            for c in &chain {
+                let title = if c.id == rec.id {
+                    format!("{} — {}", c.name, tr!("this certificate"))
+                } else {
+                    c.name.clone()
+                };
+                gc.add(&action_row(&title, &c.subject));
+            }
+        }
+    }
+
     let g2 = form.group(&tr!("OpenSSL Dump"));
     g2.add(&text_block(&crypto::dump_cert(cert.as_ref())));
 

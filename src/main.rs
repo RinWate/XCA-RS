@@ -1,6 +1,6 @@
 //! XCA RS — a Rust/GTK4 rewrite of XCA (X Certificate and Key Management).
-//! GTK4 + libadwaita frontend, OpenSSL crypto backend, SQLCipher storage,
-//! PKCS#11 hardware token support.
+//! GTK4 + libadwaita frontend, OpenSSL crypto backend, databases in the
+//! original XCA format, PKCS#11 hardware token support.
 
 mod app;
 mod crypto;
@@ -8,6 +8,7 @@ mod db;
 mod launch;
 mod pkcs11;
 mod ui;
+mod xca_format;
 
 use gtk::glib;
 use libadwaita as adw;

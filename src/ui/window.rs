@@ -18,6 +18,8 @@ pub struct Pages {
     pub toast: adw::ToastOverlay,
     pub keys: gtk::gio::ListStore,
     pub certs: gtk::gio::ListStore,
+    /// Cert-tree children by cert id (feeds the certs TreeListModel).
+    pub certs_children: crate::ui::columns::ChildrenMap,
     pub reqs: gtk::gio::ListStore,
     pub crls: gtk::gio::ListStore,
     pub keys_sel: gtk::SingleSelection,
@@ -67,11 +69,83 @@ fn window_action(app: &App, name: &str, f: impl Fn(&App) + 'static) {
     app.window.add_action(&act);
 }
 
+/// Context menu for table rows, repeating the per-page toolbar actions.
+/// Called by every cell of a page on right-click: selects the row under
+/// the cursor and shows a popover at the click position.
+///
+/// The buttons call the App methods directly. Two GMenu variants
+/// (`win.`- and `app.`-prefixed actions, gtk4 0.9 and 0.11) showed the
+/// menu but never dispatched item activation when the popover was
+/// parented to a recycled list cell — hence the plain popover.
+fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate::ui::columns::RowMenuCb {
+    let selection = selection.clone();
+    let app = app.clone();
+    let page = page.to_string();
+    Rc::new(
+        move |_item: &PkiItemObject,
+              position: u32,
+              widget: &gtk::Widget,
+              x: f64,
+              y: f64| {
+            selection.set_selected(position);
+            // The same order and entries as the page's toolbar.
+            type Act = Box<dyn Fn(&App)>;
+            let mut acts: Vec<(String, bool, Act)> = Vec::new();
+            if page == "reqs" {
+                acts.push((
+                    tr!("Sign…"),
+                    false,
+                    Box::new(|a: &App| a.sign_selected_request()),
+                ));
+            }
+            acts.push((tr!("Export…"), false, Box::new(|a: &App| a.export_selected())));
+            if page == "certs" {
+                acts.push((tr!("Revoke…"), false, Box::new(|a: &App| a.revoke_selected())));
+            }
+            acts.push((tr!("Properties"), false, Box::new(|a: &App| a.details_selected())));
+            acts.push((tr!("Delete"), true, Box::new(|a: &App| a.delete_selected())));
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            vbox.set_margin_top(6);
+            vbox.set_margin_bottom(6);
+            vbox.set_margin_start(6);
+            vbox.set_margin_end(6);
+            let popover = gtk::Popover::new();
+            popover.set_autohide(true);
+            popover.set_has_arrow(false);
+            for (label, destructive, act) in acts {
+                let b = gtk::Button::with_label(&label);
+                b.add_css_class("flat");
+                b.set_halign(gtk::Align::Fill);
+                if destructive {
+                    b.add_css_class("destructive-action");
+                }
+                let app = app.clone();
+                let pop = popover.clone();
+                // A plain popover does not close on item activation —
+                // close it first, or it floats above the opened dialog.
+                b.connect_clicked(move |_| {
+                    pop.popdown();
+                    act(&app);
+                });
+                vbox.append(&b);
+            }
+            popover.set_child(Some(&vbox));
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                x as i32, y as i32, 1, 1,
+            )));
+            popover.set_parent(widget);
+            popover.popup();
+            popover.connect_closed(|p| p.unparent());
+        },
+    )
+}
+
 pub fn build(
     ui_app: &adw::Application,
     db: Rc<Mutex<Db>>,
     db_path: std::path::PathBuf,
-    encrypted: bool,
+    password_protected: bool,
 ) -> App {
     // Show which database is open in the window (taskbar) title.
     let title = db_path
@@ -90,36 +164,86 @@ pub fn build(
     let reqs_store = gtk::gio::ListStore::new::<PkiItemObject>();
     let crls_store = gtk::gio::ListStore::new::<PkiItemObject>();
 
-    let (keys_view, keys_sel) = column_view(
-        &keys_store,
+    let keys_sel = gtk::SingleSelection::new(Some(keys_store.clone()));
+    let keys_menu = crate::ui::columns::RowMenuSlot::default();
+    let keys_view = column_view(
+        &keys_sel,
         vec![
-            text_column(&tr!("Name"), "name", true),
-            text_column(&tr!("Type"), "detail", false),
+            text_column(&tr!("Name"), "name", true, Some(keys_menu.clone())),
+            text_column(&tr!("Type"), "detail", false, Some(keys_menu.clone())),
         ],
     );
-    let (certs_view, certs_sel) = column_view(
-        &certs_store,
+    // The certificate page is hierarchical, like the original XCA: CAs
+    // hold the certificates they issued. TreeListModel expands lazily
+    // from the children map that App::refresh keeps up to date.
+    let certs_children = crate::ui::columns::ChildrenMap::default();
+    let children_for_tree = certs_children.clone();
+    let certs_tree = gtk::TreeListModel::new(
+        certs_store.clone().upcast::<gtk::gio::ListModel>(),
+        false, // no passthrough: cells see TreeListRow and can use TreeExpander
+        true,  // autoexpand
+        move |item: &gtk::glib::Object| {
+            let id = item.downcast_ref::<PkiItemObject>()?.id();
+            children_for_tree
+                .borrow()
+                .get(&id)
+                .map(|s| s.clone().upcast::<gtk::gio::ListModel>())
+        },
+    );
+    let certs_sel =
+        gtk::SingleSelection::new(Some(certs_tree.upcast::<gtk::gio::ListModel>()));
+    let certs_menu = crate::ui::columns::RowMenuSlot::default();
+    let certs_view = column_view(
+        &certs_sel,
         vec![
-            text_column(&tr!("Name"), "name", true),
-            text_column(&tr!("Subject"), "detail", true),
-            text_column(&tr!("Issuer"), "extra", true),
-            text_column(&tr!("Status"), "badge", false),
+            crate::ui::columns::tree_column(
+                &tr!("Name"),
+                "name",
+                true,
+                Some(certs_menu.clone()),
+                true,
+            ),
+            crate::ui::columns::tree_column(
+                &tr!("Subject"),
+                "detail",
+                true,
+                Some(certs_menu.clone()),
+                false,
+            ),
+            crate::ui::columns::tree_column(
+                &tr!("Issuer"),
+                "extra",
+                true,
+                Some(certs_menu.clone()),
+                false,
+            ),
+            crate::ui::columns::tree_column(
+                &tr!("Status"),
+                "badge",
+                false,
+                Some(certs_menu.clone()),
+                false,
+            ),
         ],
     );
-    let (reqs_view, reqs_sel) = column_view(
-        &reqs_store,
+    let reqs_sel = gtk::SingleSelection::new(Some(reqs_store.clone()));
+    let reqs_menu = crate::ui::columns::RowMenuSlot::default();
+    let reqs_view = column_view(
+        &reqs_sel,
         vec![
-            text_column(&tr!("Name"), "name", true),
-            text_column(&tr!("Subject"), "detail", true),
+            text_column(&tr!("Name"), "name", true, Some(reqs_menu.clone())),
+            text_column(&tr!("Subject"), "detail", true, Some(reqs_menu.clone())),
         ],
     );
-    let (crls_view, crls_sel) = column_view(
-        &crls_store,
+    let crls_sel = gtk::SingleSelection::new(Some(crls_store.clone()));
+    let crls_menu = crate::ui::columns::RowMenuSlot::default();
+    let crls_view = column_view(
+        &crls_sel,
         vec![
-            text_column(&tr!("Name"), "name", true),
-            text_column(&tr!("Issuer"), "detail", true),
-            text_column(&tr!("Next Update"), "extra", false),
-            text_column(&tr!("Entries"), "badge", false),
+            text_column(&tr!("Name"), "name", true, Some(crls_menu.clone())),
+            text_column(&tr!("Issuer"), "detail", true, Some(crls_menu.clone())),
+            text_column(&tr!("Next Update"), "extra", false, Some(crls_menu.clone())),
+            text_column(&tr!("Entries"), "badge", false, Some(crls_menu.clone())),
         ],
     );
 
@@ -196,13 +320,14 @@ pub fn build(
     let app = App {
         db,
         db_path,
-        encrypted,
+        password_protected,
         window: window.clone(),
         pages: Rc::new(Pages {
             stack,
             toast: toast_overlay,
             keys: keys_store,
             certs: certs_store,
+            certs_children,
             reqs: reqs_store,
             crls: crls_store,
             keys_sel,
@@ -331,8 +456,14 @@ pub fn build(
     window_action(&app, "token", |a| a.token_dialog());
     window_action(&app, "open-db", |a| a.open_database());
     window_action(&app, "new-db", |a| a.new_database());
-    window_action(&app, "encrypt-db", |a| a.encrypt_database_dialog());
+    window_action(&app, "db-password", |a| a.password_dialog());
     window_action(&app, "about", |a| a.about());
+    // Row context menus: the slots were handed to the column factories
+    // before the App existed; now that it does, install the callbacks.
+    *keys_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.keys_sel, "keys"));
+    *certs_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.certs_sel, "certs"));
+    *reqs_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.reqs_sel, "reqs"));
+    *crls_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.crls_sel, "crls"));
 
     ui_app.set_accels_for_action("win.new-key", &["<Control>N"]);
     ui_app.set_accels_for_action("win.new-cert", &["<Control>C"]);
@@ -354,7 +485,7 @@ pub fn build(
     let sec_db = gtk::gio::Menu::new();
     sec_db.append(Some(&tr!("Open Database…")), Some("win.open-db"));
     sec_db.append(Some(&tr!("New Database…")), Some("win.new-db"));
-    sec_db.append(Some(&tr!("Encrypt Database…")), Some("win.encrypt-db"));
+    sec_db.append(Some(&tr!("Database Password…")), Some("win.db-password"));
     menu.append_section(Some(&tr!("Database")), &sec_db);
     let sec_about = gtk::gio::Menu::new();
     sec_about.append(Some(&tr!("About XCA RS")), Some("win.about"));
@@ -371,3 +502,6 @@ pub fn build(
     window.present();
     app
 }
+
+
+
