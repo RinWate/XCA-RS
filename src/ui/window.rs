@@ -334,6 +334,40 @@ pub fn build(
         "security-low-symbolic",
     );
 
+    // The signatures page is a tool page rather than a table: two actions
+    // with a short explanation, in the same card layout as the tables.
+    let (sign_page, sign_bar) = {
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        bar.set_margin_top(12);
+        bar.set_margin_start(12);
+        bar.set_margin_end(12);
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        card.add_css_class("card");
+        card.set_margin_start(12);
+        card.set_margin_end(12);
+        card.set_margin_bottom(12);
+        card.set_valign(gtk::Align::Start);
+        let lbl = gtk::Label::new(Some(&tr!(
+            "Sign files with a certificate from the database. A detached signature is written next to the file as <file>.p7s; an attached signature is a self-contained copy with the content inside, <file>.p7m."
+        )));
+        lbl.set_wrap(true);
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_xalign(0.0);
+        card.append(&lbl);
+        vbox.append(&bar);
+        vbox.append(&card);
+        (vbox, bar)
+    };
+    stack.add_titled_with_icon(
+        &sign_page,
+        Some("sign"),
+        &tr!("Signatures"),
+        // object-sign-symbolic is not in every Adwaita icon set; the
+        // checkbox is the closest guaranteed-available glyph.
+        "checkbox-checked-symbolic",
+    );
+
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&stack));
 
@@ -448,6 +482,13 @@ pub fn build(
     });
     bar_button(&tr!("Delete"), &["flat", "destructive-action"], &app, &crls_bar, |a| {
         a.delete_selected()
+    });
+
+    bar_button(&tr!("Sign File…"), &["suggested-action"], &app, &sign_bar, |a| {
+        a.sign_file_dialog()
+    });
+    bar_button(&tr!("Verify Signature…"), &["flat"], &app, &sign_bar, |a| {
+        a.verify_signature_dialog()
     });
 
     // ---- row activation opens properties ----

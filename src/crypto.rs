@@ -5,6 +5,7 @@
 
 use openssl::asn1::{Asn1Integer, Asn1Time};
 use openssl::bn::{BigNum, MsbOption};
+use openssl::cms::{CmsContentInfo, CMSOptions};
 use openssl::ec::{EcGroup, EcKey};
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
@@ -15,12 +16,167 @@ use openssl::rsa::Rsa;
 use openssl::stack::Stack;
 use openssl::x509::{
     X509, X509Builder, X509Name, X509NameBuilder, X509NameRef, X509Req, X509ReqBuilder,
-    X509ReqRef, X509Extension, X509Ref,
+    X509ReqRef, X509Extension, X509ExtensionRef, X509Ref,
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 
 pub type CryptoResult<T> = Result<T, String>;
 
+// ---- GOST R 34.10-2012 via the gost engine/provider ----
+
+/// Raw FFI for the engine API and string params: openssl-sys does not ship
+/// engine bindings for OpenSSL 3, and EVP_PKEY_CTX_ctrl_str is missing too.
+mod gost_ffi {
+    #![allow(non_camel_case_types)]
+    #![allow(clippy::upper_case_acronyms)]
+    use std::ffi::{c_char, c_int, c_void};
+
+    pub type ENGINE = c_void;
+
+    unsafe extern "C" {
+        pub fn ENGINE_by_id(id: *const c_char) -> *mut ENGINE;
+        pub fn CONF_modules_load_file(
+            filename: *const c_char,
+            appname: *const c_char,
+            flags: std::ffi::c_ulong,
+        ) -> c_int;
+        pub fn ENGINE_ctrl_cmd_string(
+            e: *mut ENGINE,
+            cmd_name: *const c_char,
+            arg: *const c_char,
+            cmd_optional: c_int,
+        ) -> c_int;
+        pub fn ENGINE_init(e: *mut ENGINE) -> c_int;
+        pub fn ENGINE_set_default_string(e: *mut ENGINE, def_list: *const c_char) -> c_int;
+        pub fn ENGINE_free(e: *mut ENGINE) -> c_int;
+        pub fn OBJ_txt2nid(s: *const c_char) -> c_int;
+        pub fn BIO_free(b: *mut openssl_sys::BIO) -> c_int;
+        pub fn EVP_PKEY_CTX_ctrl_str(
+            ctx: *mut openssl_sys::EVP_PKEY_CTX,
+            keytype: *const c_char,
+            value: *const c_char,
+        ) -> c_int;
+    }
+}
+
+/// GOST NIDs resolved at runtime: the numbers differ between OpenSSL
+/// builds (3.6 renumbered the GOST objects), so they are looked up by
+/// dotted OID once the gost engine is loaded.
+/// (key 256, key 512, digest 256, digest 512); 0 = not available.
+static GOST_NIDS: std::sync::OnceLock<(i32, i32, i32, i32)> = std::sync::OnceLock::new();
+
+fn gost_nids() -> (i32, i32, i32, i32) {
+    GOST_NIDS.get().copied().unwrap_or((0, 0, 0, 0))
+}
+
+unsafe fn resolve_gost_nids() -> (i32, i32, i32, i32) {
+    let n = |oid: &std::ffi::CStr| unsafe { gost_ffi::OBJ_txt2nid(oid.as_ptr()) };
+    (
+        n(c"1.2.643.7.1.1.1.1"),
+        n(c"1.2.643.7.1.1.1.2"),
+        n(c"1.2.643.7.1.1.2.3"),
+        n(c"1.2.643.7.1.1.2.4"),
+    )
+}
+
+/// Load GOST support: a "gost" provider when one exists, otherwise the
+/// gost ENGINE from the engine directory (or `XCA_GOST_ENGINE`). The
+/// engine is made the default for everything — after that GOST keys,
+/// digests and signatures work through the normal OpenSSL APIs. Idempotent.
+pub fn init_gost() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| unsafe {
+        use std::ffi::CString;
+        let name = CString::new("gost").unwrap();
+        // Future-proof: a real provider beats the engine path.
+        let prov = openssl_sys::OSSL_PROVIDER_try_load(std::ptr::null_mut(), name.as_ptr(), 1);
+        if !prov.is_null() {
+            return true; // keep it loaded for the process lifetime
+        }
+        let e = load_gost_engine(&name);
+        if e.is_null() {
+            return false;
+        }
+        // Keep the engine initialized and default forever; never finish/free.
+        let ok = gost_ffi::ENGINE_init(e) == 1
+            && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
+        if ok {
+            let _ = GOST_ENGINE_PTR.set(e as usize);
+            let _ = GOST_NIDS.set(resolve_gost_nids());
+        }
+        ok
+    })
+}
+
+/// The loaded engine, 0 when GOST came from a provider (or is absent).
+/// Key generation must pass it to EVP_PKEY_CTX_new_id: without it OpenSSL 3
+/// routes through provider fetch, which does not see engine algorithms.
+static GOST_ENGINE_PTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn gost_engine() -> *mut gost_ffi::ENGINE {
+    GOST_ENGINE_PTR.get().copied().unwrap_or(0) as *mut gost_ffi::ENGINE
+}
+
+fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
+    unsafe {
+    use std::ffi::CString;
+    let direct = gost_ffi::ENGINE_by_id(name.as_ptr());
+    if !direct.is_null() {
+        return direct;
+    }
+    // The distribution's config registers the engine exactly the way the
+    // openssl CLI does; reuse it when present.
+    for conf in ["/etc/ssl/gost.cnf", "/etc/ssl/openssl.cnf.d/gost.cnf"] {
+        if !std::path::Path::new(conf).is_file() {
+            continue;
+        }
+        let Ok(c) = CString::new(conf) else { continue };
+        gost_ffi::CONF_modules_load_file(c.as_ptr(), c"openssl_conf".as_ptr(), 0);
+        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        if !e.is_null() {
+            return e;
+        }
+    }
+    // Load the dynamic engine from known locations.
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("XCA_GOST_ENGINE") {
+        paths.push(p.into());
+    }
+    paths.push("/usr/lib/engines-3/gost.so".into());
+    paths.push("/usr/lib/ssl/engines-3/gost.so".into());
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(std::path::PathBuf::from(home).join(".local/lib/xca-rs/gost.so"));
+    }
+    for p in paths {
+        let Ok(path) = p.into_os_string().into_string() else { continue };
+        let Ok(path) = CString::new(path) else { continue };
+        let dyn_e = gost_ffi::ENGINE_by_id(c"dynamic".as_ptr());
+        if dyn_e.is_null() {
+            return std::ptr::null_mut();
+        }
+        let ok = gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"SO_PATH".as_ptr(), path.as_ptr(), 0) > 0
+            && gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"ID".as_ptr(), name.as_ptr(), 0) > 0
+            && gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"LOAD".as_ptr(), std::ptr::null(), 0) > 0;
+        gost_ffi::ENGINE_free(dyn_e);
+        if ok
+            && let e = gost_ffi::ENGINE_by_id(name.as_ptr())
+            && !e.is_null()
+        {
+            return e;
+        }
+    }
+        std::ptr::null_mut()
+    }
+}
+
+/// True when the key is a GOST R 34.10-2012 key.
+fn is_gost_key<T>(key: &PKeyRef<T>) -> bool {
+    let (k256, k512, _, _) = gost_nids();
+    let id = key.id().as_raw();
+    k256 != 0 && (id == k256 || id == k512)
+}
+
+/// Streebog digest matching a GOST key, None for everything else.
 fn err<E: std::fmt::Display>(e: E) -> String {
     format!("{e}")
 }
@@ -35,6 +191,8 @@ pub enum NewKeyKind {
     EcP384,
     EcP521,
     Ed25519,
+    Gost2012_256,
+    Gost2012_512,
 }
 
 impl NewKeyKind {
@@ -47,6 +205,8 @@ impl NewKeyKind {
             Self::EcP384 => "EC P-384",
             Self::EcP521 => "EC P-521",
             Self::Ed25519 => "Ed25519",
+            Self::Gost2012_256 => "GOST 2012-256",
+            Self::Gost2012_512 => "GOST 2012-512",
         }
     }
 
@@ -59,6 +219,8 @@ impl NewKeyKind {
                 _ => Self::EcP256,
             },
             2 => Self::Ed25519,
+            3 => Self::Gost2012_256,
+            4 => Self::Gost2012_512,
             _ => match size_idx {
                 1 => Self::Rsa3072,
                 2 => Self::Rsa4096,
@@ -86,6 +248,44 @@ pub fn generate_key(kind: NewKeyKind) -> CryptoResult<PKey<Private>> {
         NewKeyKind::EcP384 => ec_key("P-384"),
         NewKeyKind::EcP521 => ec_key("P-521"),
         NewKeyKind::Ed25519 => PKey::generate_ed25519().map_err(err),
+        NewKeyKind::Gost2012_256 => generate_gost(0),
+        NewKeyKind::Gost2012_512 => generate_gost(1),
+    }
+}
+
+/// GOST R 34.10-2012 key on paramSet A (TK-26), via the gost engine.
+/// `which`: 0 = 256-bit, 1 = 512-bit.
+fn generate_gost(which: u8) -> CryptoResult<PKey<Private>> {
+    if !init_gost() {
+        return Err(crate::tr!(
+            "GOST is not available: the gost engine is missing (install openssl-gost-engine)"
+        ));
+    }
+    let (k256, k512, _, _) = gost_nids();
+    let nid = match which {
+        0 => k256,
+        _ => k512,
+    };
+    unsafe {
+        let ctx =
+            openssl_sys::EVP_PKEY_CTX_new_id(nid, gost_engine() as *mut openssl_sys::ENGINE);
+        if ctx.is_null() {
+            return Err(format!("GOST keygen: {}", ErrorStack::get()));
+        }
+        let mut rc = openssl_sys::EVP_PKEY_keygen_init(ctx);
+        if rc == 1 {
+            rc = gost_ffi::EVP_PKEY_CTX_ctrl_str(ctx, c"paramset".as_ptr(), c"A".as_ptr());
+        }
+        let mut pkey: *mut openssl_sys::EVP_PKEY = std::ptr::null_mut();
+        if rc == 1 {
+            rc = openssl_sys::EVP_PKEY_keygen(ctx, &mut pkey);
+        }
+        openssl_sys::EVP_PKEY_CTX_free(ctx);
+        if rc == 1 && !pkey.is_null() {
+            Ok(PKey::from_ptr(pkey))
+        } else {
+            Err(format!("GOST keygen: {}", ErrorStack::get()))
+        }
     }
 }
 
@@ -119,6 +319,12 @@ pub fn key_info<P: HasPublic>(key: &PKeyRef<P>) -> (String, i32, String) {
         Id::ED25519 => ("ED25519".into(), 256, "Ed25519".into()),
         Id::ED448 => ("ED448".into(), 456, "Ed448".into()),
         Id::X25519 => ("X25519".into(), 256, "X25519".into()),
+        other if other.as_raw() == gost_nids().0 && gost_nids().0 != 0 => {
+            ("GOST2012-256".into(), 256, "paramSet A".into())
+        }
+        other if other.as_raw() == gost_nids().1 && gost_nids().1 != 0 => {
+            ("GOST2012-512".into(), 512, "paramSet A".into())
+        }
         other => (format!("{other:?}"), 0, String::new()),
     }
 }
@@ -383,6 +589,171 @@ pub struct CertParams {
     pub san: Vec<String>,
 }
 
+/// All X.509v3 extensions of a certificate, in installation order.
+pub fn cert_extensions(cert: &X509Ref) -> Vec<(String, bool, String)> {
+    unsafe {
+        let stack = openssl_sys::X509_get0_extensions(cert.as_ptr());
+        let n = if stack.is_null() {
+            0
+        } else {
+            openssl_sys::OPENSSL_sk_num(stack as *const openssl_sys::OPENSSL_STACK)
+        };
+        (0..n)
+            .map(|i| {
+                let ext = openssl_sys::OPENSSL_sk_value(
+                    stack as *const openssl_sys::OPENSSL_STACK,
+                    i,
+                ) as *mut openssl_sys::X509_EXTENSION;
+                ext_info(X509ExtensionRef::from_ptr(ext))
+            })
+            .collect()
+    }
+}
+
+/// Human-readable X.509v3 extension: (long name, critical, value as
+/// OpenSSL prints it).
+pub fn ext_info(ext: &X509ExtensionRef) -> (String, bool, String) {
+    unsafe {
+        let obj = openssl_sys::X509_EXTENSION_get_object(ext.as_ptr());
+        let mut buf = [0 as std::ffi::c_char; 256];
+        let n = openssl_sys::OBJ_obj2txt(
+            buf.as_mut_ptr(),
+            buf.len() as std::ffi::c_int,
+            obj,
+            0, // prefer the readable name, dotted OID as fallback
+        );
+        let name = if n > 0 {
+            let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, n as usize);
+            String::from_utf8_lossy(bytes).to_string()
+        } else {
+            "extension".to_string()
+        };
+        let critical = openssl_sys::X509_EXTENSION_get_critical(ext.as_ptr()) == 1;
+        let mut value = String::new();
+        let bio = openssl_sys::BIO_new(openssl_sys::BIO_s_mem());
+        if !bio.is_null() {
+            let rc = openssl_sys::X509V3_EXT_print(bio, ext.as_ptr(), 0, 0);
+            if rc > 0 {
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                // BIO_CTRL_INFO = 3: parg is a char** receiving the buffer
+                let len = openssl_sys::BIO_ctrl(
+                    bio,
+                    3,
+                    0,
+                    &mut ptr as *mut *mut std::ffi::c_void as *mut std::ffi::c_void,
+                );
+                if len > 0 && !ptr.is_null() {
+                    let bytes =
+                        std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                    value = String::from_utf8_lossy(bytes).trim().to_string();
+                }
+            }
+            gost_ffi::BIO_free(bio);
+        }
+        (name, critical, value)
+    }
+}
+
+// ---- CMS file signatures ----
+
+/// How a file signature travels alongside the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureKind {
+    /// Only the signature and the signer certificate (file → `*.p7s`).
+    Detached,
+    /// The content is embedded in the signature (self-contained `*.p7m`).
+    Attached,
+}
+
+/// Sign file bytes as CMS SignedData (PKCS#7 DER). `chain` certificates
+/// (e.g. the issuing CAs) are embedded alongside the signer certificate,
+/// so the signature can be verified without access to the database.
+pub fn sign_file(
+    cert: &X509Ref,
+    key: &PKeyRef<Private>,
+    data: &[u8],
+    kind: SignatureKind,
+    chain: &[X509],
+) -> CryptoResult<Vec<u8>> {
+    let mut flags = CMSOptions::BINARY | CMSOptions::NOSMIMECAP;
+    if matches!(kind, SignatureKind::Detached) {
+        flags |= CMSOptions::DETACHED;
+    }
+    let extra = if chain.is_empty() {
+        None
+    } else {
+        let mut stack = Stack::new().map_err(err)?;
+        for c in chain {
+            stack.push(c.clone()).map_err(err)?;
+        }
+        Some(stack)
+    };
+    let cms = CmsContentInfo::sign(
+        Some(cert),
+        Some(key),
+        extra.as_deref(),
+        Some(data),
+        flags,
+    )
+    .map_err(|e| format!("CMS signing failed: {e}"))?;
+    cms.to_der().map_err(err)
+}
+
+/// Outcome of a signature check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// Signature and the signer's certificate chain both verified.
+    Trusted,
+    /// The signature is mathematically valid, but the signer chain could
+    /// not be traced to any certificate in the database.
+    SignatureOnly,
+}
+
+/// Verify a CMS signature. `detached_data` is the original file for a
+/// detached signature (ignored for attached ones); `anchors` — typically
+/// all certificates from the database — build the trust store. Falls back
+/// to a signature-only check when the chain cannot be established.
+pub fn verify_signature(
+    sig: &[u8],
+    detached_data: Option<&[u8]>,
+    anchors: &[X509],
+) -> Result<VerifyOutcome, String> {
+    let mut cms =
+        CmsContentInfo::from_der(sig).map_err(|e| format!("Not a CMS signature: {e}"))?;
+    let mut store_builder = openssl::x509::store::X509StoreBuilder::new().map_err(err)?;
+    for c in anchors {
+        let _ = store_builder.add_cert(c.clone());
+    }
+    // CMS_verify would otherwise demand the S/MIME-signing purpose
+    // (emailProtection) from the signer — an ordinary TLS certificate
+    // would then fail chain validation and land in the "signer not in
+    // the database" fallback despite a complete chain. Purpose ANY keeps
+    // the full chain and validity checks.
+    store_builder
+        .set_purpose(openssl::x509::X509PurposeId::ANY)
+        .map_err(err)?;
+    let store = store_builder.build();
+    let strict = cms.verify(
+        None,
+        Some(store.as_ref()),
+        detached_data,
+        None,
+        CMSOptions::BINARY,
+    );
+    if strict.is_ok() {
+        return Ok(VerifyOutcome::Trusted);
+    }
+    cms.verify(
+        None,
+        None,
+        detached_data,
+        None,
+        CMSOptions::BINARY | CMSOptions::NO_SIGNER_CERT_VERIFY,
+    )
+    .map(|_| VerifyOutcome::SignatureOnly)
+    .map_err(|e| format!("Signature verification failed: {e}"))
+}
+
 // ---- hand-assembled unencrypted PKCS#12 ----
 //
 // PKCS12_create always encrypts the bags and adds an integrity MAC, even
@@ -563,12 +934,14 @@ fn is_pure_eddsa<T>(key: &PKeyRef<T>) -> bool {
 }
 
 fn sign_x509<K: HasPrivate>(b: X509Builder, key: &PKeyRef<K>) -> CryptoResult<X509> {
-    if is_pure_eddsa(key) {
+    // Ed25519 is pure-EdDSA and GOST keys need the engine's own default
+    // digest (Streebog): both take the NULL-digest C path.
+    if is_pure_eddsa(key) || is_gost_key(key) {
         let cert = b.build();
         let rc =
             unsafe { openssl_sys::X509_sign(cert.as_ptr(), key.as_ptr(), std::ptr::null()) };
         if rc <= 0 {
-            return Err(format!("Ed25519 signing failed: {}", ErrorStack::get()));
+            return Err(format!("signing failed: {}", ErrorStack::get()));
         }
         Ok(cert)
     } else {
@@ -579,13 +952,13 @@ fn sign_x509<K: HasPrivate>(b: X509Builder, key: &PKeyRef<K>) -> CryptoResult<X5
 }
 
 fn sign_req<K: HasPrivate>(b: X509ReqBuilder, key: &PKeyRef<K>) -> CryptoResult<X509Req> {
-    if is_pure_eddsa(key) {
+    if is_pure_eddsa(key) || is_gost_key(key) {
         let req = b.build();
         let rc = unsafe {
             openssl_sys::X509_REQ_sign(req.as_ptr(), key.as_ptr(), std::ptr::null())
         };
         if rc <= 0 {
-            return Err(format!("Ed25519 signing failed: {}", ErrorStack::get()));
+            return Err(format!("signing failed: {}", ErrorStack::get()));
         }
         Ok(req)
     } else {
@@ -901,8 +1274,19 @@ pub fn build_crl<K: HasPrivate>(
         rb.set_revocation_date(t.as_ref()).map_err(err)?;
         b.add_revoked(rb.build()).map_err(err)?;
     }
-    b.sign(ca_key, MessageDigest::sha256()).map_err(err)?;
-    b.build().map_err(err)
+    if is_gost_key(ca_key) {
+        let crl = b.build().map_err(err)?;
+        let rc = unsafe {
+            openssl_sys::X509_CRL_sign(crl.as_ptr(), ca_key.as_ptr(), std::ptr::null())
+        };
+        if rc <= 0 {
+            return Err(format!("signing failed: {}", ErrorStack::get()));
+        }
+        Ok(crl)
+    } else {
+        b.sign(ca_key, MessageDigest::sha256()).map_err(err)?;
+        b.build().map_err(err)
+    }
 }
 
 /// Build a certificate-signing request. Note: the openssl crate does not
@@ -1130,6 +1514,260 @@ mod tests {
         assert!(parsed.pkey.is_some());
         assert!(same_public_key(parsed.pkey.as_ref().unwrap(), key.as_ref()));
         assert_eq!(parsed.ca.as_ref().map(|s| s.len()).unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn cms_sign_verify_roundtrip() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let name = subject("Signer").build_name().unwrap();
+        let cert = build_certificate(
+            &name,
+            &key,
+            &key,
+            None,
+            &CertParams {
+                validity_days: 365,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let data = b"the quick brown file".to_vec();
+
+        // Attached: the content travels inside the signature.
+        let att =
+            sign_file(cert.as_ref(), key.as_ref(), &data, SignatureKind::Attached, &[]).unwrap();
+        assert!(att.windows(data.len()).any(|w| w == data));
+        assert_eq!(
+            verify_signature(&att, None, std::slice::from_ref(&cert)).unwrap(),
+            VerifyOutcome::Trusted
+        );
+        // No anchors at all: still a valid signature, chain not traced.
+        assert_eq!(
+            verify_signature(&att, None, &[]).unwrap(),
+            VerifyOutcome::SignatureOnly
+        );
+
+        // Detached: the file itself must not be inside the signature.
+        let det =
+            sign_file(cert.as_ref(), key.as_ref(), &data, SignatureKind::Detached, &[]).unwrap();
+        assert!(!det.windows(data.len()).any(|w| w == data));
+        assert_eq!(
+            verify_signature(&det, Some(&data), std::slice::from_ref(&cert)).unwrap(),
+            VerifyOutcome::Trusted
+        );
+        // Modified original → the signature must not verify.
+        let mut tampered = data.clone();
+        tampered[0] ^= 1;
+        assert!(
+            verify_signature(&det, Some(&tampered), std::slice::from_ref(&cert)).is_err()
+        );
+        // Wrong format altogether.
+        assert!(verify_signature(b"not a signature", None, &[]).is_err());
+
+        // A leaf signed by the CA, with the CA chain embedded: the CA DER
+        // travels inside the signature, and verification with the root as
+        // the only anchor succeeds.
+        let leaf_key = generate_key(NewKeyKind::EcP256).unwrap();
+        let leaf = build_certificate(
+            &subject("signer-leaf.example.com").build_name().unwrap(),
+            &leaf_key,
+            key.as_ref(),
+            Some(cert.as_ref()),
+            &CertParams {
+                validity_days: 365,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let det = sign_file(
+            leaf.as_ref(),
+            leaf_key.as_ref(),
+            &data,
+            SignatureKind::Detached,
+            std::slice::from_ref(&cert),
+        )
+        .unwrap();
+        let ca_der = cert.to_der().unwrap();
+        assert!(det.windows(ca_der.len()).any(|w| w == ca_der));
+        assert_eq!(
+            verify_signature(&det, Some(&data), std::slice::from_ref(&cert)).unwrap(),
+            VerifyOutcome::Trusted
+        );
+
+        // A TLS leaf (serverAuth EKU) signed by the same CA: strict chain
+        // verification must not demand the S/MIME-signing purpose, or every
+        // ordinary certificate would report "signer not in the database".
+        let tls_key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let tls = build_certificate(
+            &subject("www.example.com").build_name().unwrap(),
+            &tls_key,
+            key.as_ref(),
+            Some(cert.as_ref()),
+            &CertParams {
+                validity_days: 397,
+                server_auth: true,
+                san: vec!["DNS:www.example.com".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let det = sign_file(
+            tls.as_ref(),
+            tls_key.as_ref(),
+            &data,
+            SignatureKind::Detached,
+            std::slice::from_ref(&cert),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_signature(&det, Some(&data), std::slice::from_ref(&cert)).unwrap(),
+            VerifyOutcome::Trusted
+        );
+    }
+
+    /// Full GOST round trip, skipped when the gost engine is unavailable.
+    #[test]
+    fn gost_keygen_cert_and_cms() {
+        if !init_gost() {
+            eprintln!("gost engine not available — test skipped");
+            return;
+        }
+        for (kind, bits) in [
+            (NewKeyKind::Gost2012_256, 256),
+            (NewKeyKind::Gost2012_512, 512),
+        ] {
+            let key = generate_key(kind).unwrap();
+            let (kn256, kn512, _, _) = gost_nids();
+            assert!(key.id().as_raw() == kn256 || key.id().as_raw() == kn512);
+            let (k, b, curve) = key_info(key.as_ref());
+            assert_eq!(b, bits);
+            assert!(k.starts_with("GOST2012"), "{k}");
+            assert_eq!(curve, "paramSet A");
+
+            // Self-signed CA with a GOST R 34.10-2012 / Streebog signature.
+            let name = subject("GOST Root").build_name().unwrap();
+            let cert = build_certificate(
+                &name,
+                &key,
+                &key,
+                None,
+                &CertParams {
+                    validity_days: 365,
+                    is_ca: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(cert.verify(key.as_ref()).unwrap());
+            let text = String::from_utf8_lossy(&cert.to_text().unwrap()).to_string();
+            assert!(text.contains("GOST R 34.10-2012"), "{text}");
+            assert!(text.contains("GOST R 34.11-2012"), "{text}");
+
+            // PKCS#8 storage round trip (needs the engine on load).
+            let pem = key.private_key_to_pem_pkcs8().unwrap();
+            let back = load_private_key(&pem).unwrap();
+            assert!(same_public_key(back.as_ref(), key.as_ref()));
+
+            // CMS file signatures: detached and attached, both verify.
+            let data = b"gost payload".to_vec();
+            let det = sign_file(
+                cert.as_ref(),
+                key.as_ref(),
+                &data,
+                SignatureKind::Detached,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                verify_signature(&det, Some(&data), std::slice::from_ref(&cert)).unwrap(),
+                VerifyOutcome::Trusted
+            );
+            let att = sign_file(
+                cert.as_ref(),
+                key.as_ref(),
+                &data,
+                SignatureKind::Attached,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                verify_signature(&att, None, std::slice::from_ref(&cert)).unwrap(),
+                VerifyOutcome::Trusted
+            );
+            // Tampering must not verify.
+            let mut bad = data.clone();
+            bad[0] ^= 1;
+            assert!(verify_signature(&det, Some(&bad), std::slice::from_ref(&cert)).is_err());
+        }
+
+        // CSR signed with GOST.
+        let key = generate_key(NewKeyKind::Gost2012_256).unwrap();
+        let req = build_request(&subject("gost csr").build_name().unwrap(), key.as_ref()).unwrap();
+        assert!(req.verify(key.as_ref()).unwrap());
+
+        // A CA-signed GOST leaf as well (Streebog digest via the CA key).
+        let ca_key = generate_key(NewKeyKind::Gost2012_256).unwrap();
+        let ca = build_certificate(
+            &subject("GOST CA").build_name().unwrap(),
+            &ca_key,
+            &ca_key,
+            None,
+            &CertParams {
+                validity_days: 3650,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let leaf = build_certificate(
+            &subject("gost.example.com").build_name().unwrap(),
+            &key,
+            ca_key.as_ref(),
+            Some(ca.as_ref()),
+            &CertParams {
+                validity_days: 365,
+                server_auth: true,
+                san: vec!["DNS:gost.example.com".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(leaf.verify(ca.public_key().unwrap().as_ref()).unwrap());
+    }
+
+    #[test]
+    fn cert_extensions_listing() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let name = subject("Ext List").build_name().unwrap();
+        let cert = build_certificate(
+            &name,
+            &key,
+            &key,
+            None,
+            &CertParams {
+                validity_days: 365,
+                is_ca: true,
+                path_len: Some(2),
+                server_auth: true,
+                san: vec!["DNS:ext.example.com".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let exts = cert_extensions(cert.as_ref());
+        assert!(!exts.is_empty());
+        let (_bc_name, bc_crit, bc_val) = exts
+            .iter()
+            .find(|(n, _, _)| n.contains("Basic Constraints"))
+            .expect("basicConstraints present");
+        assert!(bc_crit);
+        assert!(bc_val.contains("CA:TRUE"), "{bc_val}");
+        assert!(bc_val.contains("pathlen:2"), "{bc_val}");
+        assert!(exts.iter().any(|(n, _, v)| n.contains("Key Usage") && v.contains("Digital Signature")));
+        assert!(exts
+            .iter()
+            .any(|(n, _, v)| n.contains("Alternative Name") && v.contains("ext.example.com")));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gtk::prelude::*;
 use libadwaita::prelude::*;
 
 pub fn open(app: &App) {
-    let form = form_dialog(&tr!("New Certificate Request"), 480);
+    let form = form_dialog(&tr!("New Certificate Request"), 560);
 
     let name_row = entry(&tr!("Internal Name"));
     let cn = entry(&tr!("Common Name (CN)"));
@@ -37,11 +37,14 @@ pub fn open(app: &App) {
             tr!("Generate new RSA 2048").as_str(),
             tr!("Generate new EC P-256").as_str(),
             tr!("Generate new Ed25519").as_str(),
+            tr!("Generate new GOST 2012-256").as_str(),
+            tr!("Generate new GOST 2012-512").as_str(),
         ],
         &named,
         0,
     );
     let g_key = form.group(&tr!("Key"));
+    super::combo_min_width(&key_row, 400);
     g_key.add(&key_row);
 
     let cancel = form.close_button(&tr!("Cancel"));
@@ -94,6 +97,8 @@ pub fn open(app: &App) {
                     let kind = match sel {
                         1 => crypto::NewKeyKind::EcP256,
                         2 => crypto::NewKeyKind::Ed25519,
+                        3 => crypto::NewKeyKind::Gost2012_256,
+                        4 => crypto::NewKeyKind::Gost2012_512,
                         _ => crypto::NewKeyKind::Rsa2048,
                     };
                     let key = crypto::generate_key(kind)?;

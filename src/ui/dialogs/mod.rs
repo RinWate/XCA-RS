@@ -14,6 +14,7 @@ pub mod new_key;
 pub mod new_req;
 pub mod password;
 pub mod san;
+pub mod sign;
 pub mod token;
 
 pub fn error_dialog(parent: &adw::ApplicationWindow, msg: &str) {
@@ -119,6 +120,27 @@ pub fn combo(title: &str, items: &[&str], selected: u32) -> adw::ComboRow {
     row
 }
 
+/// Give an adw::ComboRow's popup a minimum width. ComboRow renders its
+/// list in an internal GtkPopover whose item labels ellipsize to the
+/// popover width — without this, long entries like "Create new GOST
+/// 2012-512" or key labels get cut off.
+pub fn combo_min_width(row: &adw::ComboRow, width: i32) {
+    fn apply(w: &gtk::Widget, width: i32) {
+        if w.type_().is_a(gtk::Popover::static_type())
+            || w.type_().is_a(gtk::PopoverMenu::static_type())
+            || w.type_().is_a(gtk::DropDown::static_type())
+        {
+            w.set_width_request(width);
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            apply(&c, width);
+            child = c.next_sibling();
+        }
+    }
+    apply(row.upcast_ref(), width);
+}
+
 /// ComboRow over dynamic labels: fixed prefix options plus named items with
 /// ids. Returns the row and the id list aligned with the model items
 /// (`None` for the prefix options).
@@ -183,3 +205,4 @@ pub fn text_block(text: &str) -> gtk::Widget {
     box_.add_css_class("card");
     box_.upcast::<gtk::Widget>()
 }
+

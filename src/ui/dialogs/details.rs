@@ -98,6 +98,21 @@ pub fn open_cert(app: &App, rec: &CertRecord) {
         }
     }
 
+    // Installed X.509v3 extensions, as OpenSSL prints them.
+    let exts = crypto::cert_extensions(cert.as_ref());
+    if !exts.is_empty() {
+        let ge = form.group(&tr!("X.509 v3 Extensions"));
+        for (name, critical, value) in exts {
+            let title = if critical {
+                format!("{name} ({})", tr!("critical"))
+            } else {
+                name
+            };
+            let value = value.replace(['\n', '\r'], " ");
+            ge.add(&action_row(&title, &value));
+        }
+    }
+
     // The chain up to the root, as linked in the database.
     if let Ok(chain) = app.db.lock().unwrap().cert_chain(rec.id)
         && chain.len() > 1 {

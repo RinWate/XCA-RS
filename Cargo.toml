@@ -1,6 +1,6 @@
 [package]
 name = "xca-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "XCA (X Certificate and Key Management) rewritten in Rust with GTK4 + libadwaita"
 license = "GPL-2.0-or-later"

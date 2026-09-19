@@ -12,11 +12,16 @@ pub fn open(app: &App) {
     let form = form_dialog(&tr!("New Private Key"), 420);
 
     let name_row = entry(&tr!("Internal Name"));
-    let type_row = combo(&tr!("Key Type"), &["RSA", "EC", "Ed25519"], 0);
+    let type_row = combo(
+        &tr!("Key Type"),
+        &["RSA", "EC", "Ed25519", "GOST 2012-256", "GOST 2012-512"],
+        0,
+    );
 
     let sizes_rsa = gtk::StringList::new(&[&tr!("2048 bits"), &tr!("3072 bits"), &tr!("4096 bits")]);
     let sizes_ec = gtk::StringList::new(&["P-256", "P-384", "P-521"]);
     let sizes_ed = gtk::StringList::new(&["Ed25519"]);
+    let sizes_gost = gtk::StringList::new(&["ParamSet A"]);
     let size_row = adw::ComboRow::builder().title(tr!("Key Size / Curve")).build();
     size_row.set_model(Some(&sizes_rsa));
     size_row.set_expression(Some(&gtk::StringObject::this_expression("string")));
@@ -25,11 +30,13 @@ pub fn open(app: &App) {
         let size_row = size_row.clone();
         let ec = sizes_ec.clone();
         let ed = sizes_ed.clone();
+        let gost = sizes_gost.clone();
         let rsa = sizes_rsa.clone();
         type_row.connect_notify_local(Some("selected"), move |row: &adw::ComboRow, _| {
             let model = match row.selected() {
                 1 => ec.clone(),
                 2 => ed.clone(),
+                3 | 4 => gost.clone(),
                 _ => rsa.clone(),
             };
             size_row.set_model(Some(&model));

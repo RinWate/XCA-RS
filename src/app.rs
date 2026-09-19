@@ -210,6 +210,14 @@ impl App {
         dialogs::token::open(self);
     }
 
+    pub fn sign_file_dialog(&self) {
+        dialogs::sign::open_sign(self);
+    }
+
+    pub fn verify_signature_dialog(&self) {
+        dialogs::sign::open_verify(self);
+    }
+
     pub fn password_dialog(&self) {
         dialogs::password::set_or_change(self);
     }

@@ -37,7 +37,7 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         } else {
             tr!("New Certificate")
         }),
-        500,
+        580,
     );
 
     let default_name = req_info
@@ -78,11 +78,14 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                 tr!("Generate new RSA 2048").as_str(),
                 tr!("Generate new EC P-256").as_str(),
                 tr!("Generate new Ed25519").as_str(),
+                tr!("Generate new GOST 2012-256").as_str(),
+                tr!("Generate new GOST 2012-512").as_str(),
             ],
             &named,
             0,
         );
         let g = form.group(&tr!("Key"));
+        super::combo_min_width(&key_row, 400);
         g.add(&key_row);
         key_rows = Some((key_row, key_ids));
     }
@@ -111,6 +114,7 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         combo_ids(&tr!("Signed by"), &[tr!("Self-signed").as_str()], &cas, 0)
     };
     let g_issuer = form.group(&tr!("Issuer"));
+    super::combo_min_width(&issuer_row, 400);
     g_issuer.add(&issuer_row);
 
     let validity = spin(&tr!("Validity"), 10.0, 1.0, 1000.0, 1.0);
@@ -384,6 +388,8 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                                 let kind = match sel {
                                     1 => crypto::NewKeyKind::EcP256,
                                     2 => crypto::NewKeyKind::Ed25519,
+                                    3 => crypto::NewKeyKind::Gost2012_256,
+                                    4 => crypto::NewKeyKind::Gost2012_512,
                                     _ => crypto::NewKeyKind::Rsa2048,
                                 };
                                 let key = crypto::generate_key(kind)?;

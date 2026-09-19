@@ -87,6 +87,9 @@ fn database_path() -> PathBuf {
 }
 
 fn main() {
+    // GOST keys/certificates need the gost engine loaded before anything
+    // parses or generates crypto objects; silently no-ops without it.
+    let _ = crypto::init_gost();
     rust_i18n::set_locale(detect_locale());
     let app = adw::Application::builder()
         .application_id(APP_ID)
