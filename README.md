@@ -1,6 +1,6 @@
 # XCA RS
 
-A from-scratch rewrite of [XCA](https://hohnstaedt.github.io/xca/) (X Certificate
+A from-scratch rewrite of [XCA](https://github.com/chris2511/xca) (X Certificate
 and Key Management) in **Rust**, with a **GTK4 + libadwaita** interface — the
 same application concept as XCA (manage private keys, certificates, certificate
 signing requests, revocation), restated as a native GNOME app.
