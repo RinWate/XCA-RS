@@ -17,17 +17,28 @@ pub fn open(app: &App) {
         Some(&app.window),
         None::<&gtk::gio::Cancellable>,
         move |res| match res {
-            Ok(file) => match file.load_contents(None::<&gtk::gio::Cancellable>) {
-                Ok((data, _)) => {
-                    let data = data.to_vec();
-                    if crypto::probably_needs_password(&data) {
-                        ask_password(&app2, data);
-                    } else {
-                        do_import(&app2, data, None);
+            Ok(file) => {
+                // A CryptoPro key container: the picked file sits in (or is)
+                // the six-file folder — it needs its own password flow.
+                if let Some(path) = file.path()
+                    && crate::cpcsp::is_container_entry(&path)
+                {
+                    return ask_container_password(&app2, &path);
+                }
+                match file.load_contents(None::<&gtk::gio::Cancellable>) {
+                    Ok((data, _)) => {
+                        let data = data.to_vec();
+                        if crypto::probably_needs_password(&data) {
+                            ask_password(&app2, data);
+                        } else {
+                            do_import(&app2, data, None);
+                        }
+                    }
+                    Err(e) => {
+                        error_dialog(&app2.window, &format!("{}: {e}", tr!("Cannot read file")))
                     }
                 }
-                Err(e) => error_dialog(&app2.window, &format!("{}: {e}", tr!("Cannot read file"))),
-            },
+            }
             Err(e) => {
                 if !e.matches(gtk::gio::IOErrorEnum::Cancelled) {
                     error_dialog(&app2.window, &format!("{}: {e}", tr!("Import canceled")));
@@ -61,6 +72,95 @@ fn ask_password(app: &App, data: Vec<u8>) {
     });
 
     form.dlg.present(Some(&app.window));
+}
+
+/// CryptoPro container import: password prompt first, then the key
+/// lands in the database and links to its certificate when that is
+/// already imported.
+fn ask_container_password(app: &App, path: &std::path::Path) {
+    let form = form_dialog(&tr!("CryptoPro Container"), 380);
+    let pw = password_entry(&tr!("Password"));
+    let g = form.group(&tr!("CryptoPro Container"));
+    g.add(&pw);
+
+    let cancel = form.close_button(&tr!("Cancel"));
+    let unlock = form.apply_button(&tr!("Unlock"));
+    {
+        let dlg = form.dlg.clone();
+        cancel.connect_clicked(move |_| {
+            dlg.close();
+        });
+    }
+    let app2 = app.clone();
+    let dlg = form.dlg.clone();
+    let pw = pw.clone();
+    let path = path.to_path_buf();
+    unlock.connect_clicked(move |_| {
+        let password = row_text(&pw).to_string();
+        dlg.close();
+        do_import_container(&app2, &path, &password);
+    });
+    form.dlg.present(Some(&app.window));
+}
+
+fn do_import_container(app: &App, path: &std::path::Path, password: &str) {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+    let container = match crate::cpcsp::read_container(&dir) {
+        Ok(c) => c,
+        Err(e) => return error_dialog(&app.window, &e),
+    };
+    // The header's public-key prefix validates the password; the
+    // matching certificate (when imported) confirms the curve.
+    let mut hint = None;
+    {
+        let db = app.db.lock().unwrap();
+        for rec in db.list_certs().unwrap_or_default() {
+            if let Ok(cert) = crypto::load_cert(&rec.pem) {
+                hint = Some(cert);
+                break;
+            }
+        }
+    }
+    // One certificate is as good a probe as any: the scalar depends only
+    // on the container, and the public-key check picks the right curve.
+    let key = match crate::cpcsp::decrypt_container(&container, password, hint.as_ref()) {
+        Ok(k) => k,
+        Err(e) => return error_dialog(&app.window, &e),
+    };
+
+    let (kind, bits, _) = crypto::key_info(key.as_ref());
+    let pem = key.private_key_to_pem_pkcs8().unwrap_or_default();
+    let mut linked_cert = 0usize;
+    {
+        let db = app.db.lock().unwrap();
+        let mut key_id = None;
+        if !db.key_exists(&pem).unwrap_or(false) {
+            let label = format!("Imported {kind} {bits}");
+            key_id = db.insert_key(&label, &pem).ok();
+        }
+        if let Some(kid) = key_id {
+            for rec in db.list_certs().unwrap_or_default() {
+                let Ok(cert) = crypto::load_cert(&rec.pem) else { continue };
+                let Ok(cpk) = cert.public_key() else { continue };
+                if cpk.public_eq(key.as_ref())
+                    && db.set_cert_refs(rec.id, Some(kid), None).is_ok()
+                {
+                    linked_cert += 1;
+                    break;
+                }
+            }
+        }
+    }
+    app.refresh();
+    if linked_cert > 0 {
+        app.toast(&tr!("Private key imported and linked to its certificate"));
+    } else {
+        app.toast(&tr!("Private key imported"));
+    }
 }
 
 pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {

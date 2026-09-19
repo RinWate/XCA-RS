@@ -3,9 +3,11 @@
 //! original XCA format, PKCS#11 hardware token support.
 
 mod app;
+mod cpcsp;
 mod crypto;
 mod db;
 mod launch;
+mod pdf_sign;
 mod pkcs11;
 mod ui;
 mod xca_format;

@@ -274,6 +274,13 @@ pub fn build(
                 false,
             ),
             crate::ui::columns::tree_column(
+                &tr!("Signature"),
+                "sig",
+                false,
+                Some(certs_menu.clone()),
+                false,
+            ),
+            crate::ui::columns::tree_column(
                 &tr!("Status"),
                 "badge",
                 false,
@@ -289,6 +296,7 @@ pub fn build(
         vec![
             text_column(&tr!("Name"), "name", true, Some(reqs_menu.clone())),
             text_column(&tr!("Subject"), "detail", true, Some(reqs_menu.clone())),
+            text_column(&tr!("Status"), "extra", false, Some(reqs_menu.clone())),
         ],
     );
     let crls_sel = gtk::SingleSelection::new(Some(crls_store.clone()));

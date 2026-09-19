@@ -26,10 +26,11 @@ pub struct App {
 fn cert_badge(
     c: &CertRecord,
     revoked: &std::collections::HashMap<i64, std::collections::HashSet<String>>,
+    parsed: Option<&openssl::x509::X509>,
 ) -> String {
-    let mut badge = match crypto::load_cert(&c.pem).map(|x| crypto::cert_summary(x.as_ref())) {
-        Ok(s) => crypto::cert_status(&s),
-        Err(_) => {
+    let mut badge = match parsed.map(|x| crypto::cert_summary(x)) {
+        Some(s) => crypto::cert_status(&s),
+        None => {
             let mut parts = Vec::new();
             if c.ca {
                 parts.push("CA".to_string());
@@ -71,7 +72,7 @@ impl App {
         for k in keys {
             self.pages
                 .keys
-                .append(&PkiItemObject::new(k.id, &k.name, &k.type_label(), "", ""));
+                .append(&PkiItemObject::new(k.id, &k.name, &k.type_label(), "", "", ""));
         }
 
         // The certificate page is a tree like the original XCA's: a CA
@@ -116,10 +117,22 @@ impl App {
         }
         let mut objects = std::collections::HashMap::new();
         for c in &certs {
-            let badge = cert_badge(c, &revoked);
+            let parsed = crypto::load_cert(&c.pem).ok();
+            let badge = cert_badge(c, &revoked, parsed.as_ref());
+            // The Issuer column stays readable: show the CN alone, the
+            // full DN only when there is no CN.
+            let issuer = parsed
+                .as_ref()
+                .and_then(|x| crypto::name_cn(x.issuer_name()))
+                .filter(|cn| !cn.is_empty())
+                .unwrap_or_else(|| c.issuer.clone());
+            let sig = parsed
+                .as_ref()
+                .map(|x| crypto::signature_algorithm(x.as_ref()))
+                .unwrap_or_default();
             objects.insert(
                 c.id,
-                PkiItemObject::new(c.id, &c.name, &c.subject, &c.issuer, &badge),
+                PkiItemObject::new(c.id, &c.name, &c.subject, &issuer, &badge, &sig),
             );
         }
         *self.pages.certs_children.borrow_mut() = children_ids
@@ -142,10 +155,24 @@ impl App {
         self.pages.restore_certs_collapsed(&collapsed);
 
         self.pages.reqs.remove_all();
+        // A request is "signed" once some certificate in the database was
+        // issued for the same public key (same rule as the original XCA).
+        let cert_objs: Vec<openssl::x509::X509> = certs
+            .iter()
+            .filter_map(|c| crypto::load_cert(&c.pem).ok())
+            .collect();
         for r in reqs {
+            let signed = crypto::load_req(&r.pem)
+                .ok()
+                .is_some_and(|req| crypto::req_is_signed(req.as_ref(), &cert_objs));
+            let status = if signed {
+                tr!("Signed")
+            } else {
+                tr!("Not signed")
+            };
             self.pages
                 .reqs
-                .append(&PkiItemObject::new(r.id, &r.name, &r.subject, "", ""));
+                .append(&PkiItemObject::new(r.id, &r.name, &r.subject, &status, "", ""));
         }
 
         self.pages.crls.remove_all();
@@ -157,6 +184,7 @@ impl App {
                 &c.issuer,
                 &c.next_update,
                 &extra,
+                "",
             ));
         }
     }

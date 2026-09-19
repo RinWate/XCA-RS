@@ -15,6 +15,7 @@ pub fn open(app: &App) {
     let cn = entry(&tr!("Common Name (CN)"));
     let org = entry(&tr!("Organization (O)"));
     let org_unit = entry(&tr!("Organizational Unit (OU)"));
+    let title = entry(&tr!("Title (T)"));
     let country = entry(&tr!("Country (C)"));
     let email = entry(&tr!("E-Mail (emailAddress)"));
 
@@ -23,6 +24,7 @@ pub fn open(app: &App) {
     g_subj.add(&cn);
     g_subj.add(&org);
     g_subj.add(&org_unit);
+    g_subj.add(&title);
     g_subj.add(&country);
     g_subj.add(&email);
 
@@ -44,7 +46,6 @@ pub fn open(app: &App) {
         0,
     );
     let g_key = form.group(&tr!("Key"));
-    super::combo_min_width(&key_row, 400);
     g_key.add(&key_row);
 
     let cancel = form.close_button(&tr!("Cancel"));
@@ -61,6 +62,7 @@ pub fn open(app: &App) {
     let cn = cn.clone();
     let org = org.clone();
     let org_unit = org_unit.clone();
+    let title = title.clone();
     let country = country.clone();
     let email = email.clone();
     let key_row = key_row.clone();
@@ -69,6 +71,7 @@ pub fn open(app: &App) {
             cn: row_text(&cn).trim().to_string(),
             org: row_text(&org).trim().to_string(),
             org_unit: row_text(&org_unit).trim().to_string(),
+            title: row_text(&title).trim().to_string(),
             country: row_text(&country).trim().to_string(),
             email: row_text(&email).trim().to_string(),
         };

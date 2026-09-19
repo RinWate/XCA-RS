@@ -30,7 +30,6 @@ pub fn open(app: &App) {
 
     let form = form_dialog(&tr!("New Revocation List"), 440);
     let (ca_row, ca_ids) = combo_ids(&tr!("Issuing CA"), &[], &cas, 0);
-    super::combo_min_width(&ca_row, 400);
     let validity = spin(&tr!("Validity (days)"), 30.0, 1.0, 3650.0, 1.0);
     let revoked_hint = action_row(&tr!("Revoked entries"), "—");
     let g = form.group(&tr!("CRL"));

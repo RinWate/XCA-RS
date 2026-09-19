@@ -10,13 +10,14 @@ glib::wrapper! {
 }
 
 impl PkiItemObject {
-    pub fn new(id: i64, name: &str, detail: &str, extra: &str, badge: &str) -> Self {
+    pub fn new(id: i64, name: &str, detail: &str, extra: &str, badge: &str, sig: &str) -> Self {
         Object::builder()
             .property("id", id)
             .property("name", name)
             .property("detail", detail)
             .property("extra", extra)
             .property("badge", badge)
+            .property("sig", sig)
             .build()
     }
 }
@@ -38,6 +39,9 @@ mod imp {
         pub extra: RefCell<String>,
         #[property(get, set)]
         pub badge: RefCell<String>,
+        /// Signature algorithm (certificate rows).
+        #[property(get, set)]
+        pub sig: RefCell<String>,
     }
 
     #[glib::object_subclass]

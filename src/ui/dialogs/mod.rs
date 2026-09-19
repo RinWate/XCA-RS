@@ -13,6 +13,7 @@ pub mod new_crl;
 pub mod new_key;
 pub mod new_req;
 pub mod password;
+pub mod pdf_place;
 pub mod san;
 pub mod sign;
 pub mod token;
@@ -117,28 +118,37 @@ pub fn combo(title: &str, items: &[&str], selected: u32) -> adw::ComboRow {
     row.set_model(Some(&model));
     row.set_expression(Some(&gtk::StringObject::this_expression("string")));
     row.set_selected(selected);
+    wide_popup(&row);
     row
 }
 
-/// Give an adw::ComboRow's popup a minimum width. ComboRow renders its
-/// list in an internal GtkPopover whose item labels ellipsize to the
-/// popover width — without this, long entries like "Create new GOST
-/// 2012-512" or key labels get cut off.
-pub fn combo_min_width(row: &adw::ComboRow, width: i32) {
-    fn apply(w: &gtk::Widget, width: i32) {
-        if w.type_().is_a(gtk::Popover::static_type())
-            || w.type_().is_a(gtk::PopoverMenu::static_type())
-            || w.type_().is_a(gtk::DropDown::static_type())
-        {
-            w.set_width_request(width);
-        }
-        let mut child = w.first_child();
-        while let Some(c) = child {
-            apply(&c, width);
-            child = c.next_sibling();
-        }
-    }
-    apply(row.upcast_ref(), width);
+/// AdwComboRow's built-in popup factory caps item labels at 20 characters
+/// (`gtk_label_set_max_width_chars(20)`), so long entries — "Create new GOST
+/// 2012-512", key names — always ellipsize no matter how wide the popover
+/// is. Install a custom list factory with uncapped, margin-only labels (no
+/// selection checkmark: it appears and disappears per row, making the
+/// popover width jump).
+fn wide_popup(row: &adw::ComboRow) {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        // With gtk4 v4_8+ bindings the factory signals pass a plain
+        // glib::Object — downcast like the column factories do.
+        let item = item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_halign(gtk::Align::Fill);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        label.set_margin_start(6);
+        // Every combo in the app is backed by a StringList.
+        item.property_expression("item")
+            .chain_property::<gtk::StringObject>("string")
+            .bind(&label, "label", glib::Object::NONE);
+        item.set_child(Some(&label));
+    });
+    row.set_list_factory(Some(&factory.upcast::<gtk::ListItemFactory>()));
 }
 
 /// ComboRow over dynamic labels: fixed prefix options plus named items with

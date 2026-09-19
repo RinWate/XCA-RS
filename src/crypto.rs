@@ -113,6 +113,11 @@ pub fn init_gost() -> bool {
 /// routes through provider fetch, which does not see engine algorithms.
 static GOST_ENGINE_PTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Raw engine pointer for FFI calls outside this module (cpcsp).
+pub fn gost_engine_ptr() -> *mut std::ffi::c_void {
+    gost_engine().cast()
+}
+
 fn gost_engine() -> *mut gost_ffi::ENGINE {
     GOST_ENGINE_PTR.get().copied().unwrap_or(0) as *mut gost_ffi::ENGINE
 }
@@ -255,7 +260,7 @@ pub fn generate_key(kind: NewKeyKind) -> CryptoResult<PKey<Private>> {
 
 /// GOST R 34.10-2012 key on paramSet A (TK-26), via the gost engine.
 /// `which`: 0 = 256-bit, 1 = 512-bit.
-fn generate_gost(which: u8) -> CryptoResult<PKey<Private>> {
+pub fn generate_gost(which: u8) -> CryptoResult<PKey<Private>> {
     if !init_gost() {
         return Err(crate::tr!(
             "GOST is not available: the gost engine is missing (install openssl-gost-engine)"
@@ -476,12 +481,135 @@ pub fn cert_status(s: &CertSummary) -> String {
     parts.join(" · ")
 }
 
+/// Compact signature-algorithm label used in lists and property dialogs:
+/// "SHA-256 · RSA", "Streebog-512 · GOST R 34.10-2012-512", "Ed25519".
+pub fn signature_algorithm(cert: &X509Ref) -> String {
+    // GOST first, by the algorithm's own name: the gost engine registers
+    // the Streebog digest OIDs with unreliable NIDs (on OpenSSL 3.6 the
+    // 1.2.643.7.1.1.2.3 text resolves to md_gost12_512 and .2.4 to
+    // nothing), so digest NIDs cannot be trusted there.
+    let alg_name = cert.signature_algorithm().object().to_string();
+    if alg_name.contains("GOST R 34.10-2012") {
+        let bits = if alg_name.contains("(512") { "512" } else { "256" };
+        return format!("Streebog-{bits} · GOST R 34.10-2012-{bits}");
+    }
+    unsafe {
+        let mut md_nid: std::ffi::c_int = 0;
+        let mut pk_nid: std::ffi::c_int = 0;
+        // openssl-sys does not bind X509_get_signature_info (1.1+); it
+        // splits any signature algorithm into the digest and public-key
+        // NIDs.
+        unsafe extern "C" {
+            fn X509_get_signature_info(
+                x: *const openssl_sys::X509,
+                mdnid: *mut std::ffi::c_int,
+                pknid: *mut std::ffi::c_int,
+                secbits: *mut std::ffi::c_int,
+                flags: *mut std::ffi::c_uint,
+            ) -> std::ffi::c_int;
+        }
+        let ok = X509_get_signature_info(
+            cert.as_ptr(),
+            &mut md_nid,
+            &mut pk_nid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if ok == 1 {
+            let digest = digest_label(Nid::from_raw(md_nid));
+            let pubkey = pkey_label(Nid::from_raw(pk_nid));
+            match (digest, pubkey) {
+                (Some(d), Some(p)) => return format!("{d} · {p}"),
+                (None, Some(p)) => return p,
+                _ => {}
+            }
+        }
+    }
+    // Fallback: the algorithm object's long name (e.g. md5WithRSAEncryption).
+    alg_name
+}
+
+fn digest_label(nid: Nid) -> Option<&'static str> {
+    // (key256, key512, md256, md512) — the GOST pair set by init_gost.
+    let gost = GOST_NIDS.get().copied().unwrap_or((0, 0, 0, 0));
+    let raw = nid.as_raw();
+    Some(match nid {
+        Nid::MD5 => "MD5",
+        Nid::SHA1 => "SHA-1",
+        Nid::SHA224 => "SHA-224",
+        Nid::SHA256 => "SHA-256",
+        Nid::SHA384 => "SHA-384",
+        Nid::SHA512 => "SHA-512",
+        Nid::SHA3_224 => "SHA3-224",
+        Nid::SHA3_256 => "SHA3-256",
+        Nid::SHA3_384 => "SHA3-384",
+        Nid::SHA3_512 => "SHA3-512",
+        _ if gost.2 != 0 && raw == gost.2 => "Streebog-256",
+        _ if gost.3 != 0 && raw == gost.3 => "Streebog-512",
+        _ => return None,
+    })
+}
+
+fn pkey_label(nid: Nid) -> Option<String> {
+    let gost = GOST_NIDS.get().copied().unwrap_or((0, 0, 0, 0));
+    let raw = nid.as_raw();
+    Some(match nid {
+        Nid::RSAENCRYPTION => "RSA".into(),
+        Nid::RSASSAPSS => "RSA-PSS".into(),
+        Nid::DSA => "DSA".into(),
+        // NID_X9_62_id_ecPublicKey — no binding in the crate.
+        _ if raw == 408 => "ECDSA".into(),
+        // NID_ED25519 / NID_ED448.
+        _ if raw == 1087 => "Ed25519".into(),
+        _ if raw == 1088 => "Ed448".into(),
+        _ if gost.0 != 0 && raw == gost.0 => "GOST R 34.10-2012-256".into(),
+        _ if gost.1 != 0 && raw == gost.1 => "GOST R 34.10-2012-512".into(),
+        _ => return None,
+    })
+}
+
+/// First value of an X.509 DN attribute (CN, O, T, …).
+pub fn subject_field(name: &X509NameRef, nid: Nid) -> Option<String> {
+    name.entries_by_nid(nid)
+        .next()
+        .and_then(|e| e.data().to_string().ok())
+}
+
+/// Common Name entry of an X.509 name, if present. The certificate list
+/// shows issuer CNs instead of full DNs to keep the column readable.
+pub fn name_cn(name: &X509NameRef) -> Option<String> {
+    subject_field(name, Nid::COMMONNAME)
+}
+
+/// Lowercase SHA-256 hex of the certificate DER — the fingerprint shown
+/// on the PDF signature stamp.
+pub fn cert_fingerprint_hex(cert: &X509Ref) -> Option<String> {
+    let der = cert.to_der().ok()?;
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &der).ok()?;
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A request counts as signed once a certificate carrying the same public
+/// key exists (the original XCA marks requests the same way).
+pub fn req_is_signed(req: &X509ReqRef, certs: &[X509]) -> bool {
+    let Ok(rpk) = req.public_key() else {
+        return false;
+    };
+    certs.iter().any(|c| {
+        c.public_key()
+            .is_ok_and(|cpk| cpk.public_eq(rpk.as_ref()))
+    })
+}
+
 /// Subject entries for certificate/CSR creation.
 #[derive(Clone, Debug, Default)]
 pub struct SubjectData {
     pub cn: String,
     pub org: String,
     pub org_unit: String,
+    /// X.509 `T` (title, 2.5.4.12) — the signer's position; used by
+    /// CryptoPro-style GOST certificates.
+    pub title: String,
     pub country: String,
     pub email: String,
 }
@@ -490,10 +618,11 @@ impl SubjectData {
     pub fn build_name(&self) -> CryptoResult<X509Name> {
         let mut nb = X509NameBuilder::new().map_err(err)?;
         let mut any = false;
-        let entries: [(&str, &str); 5] = [
+        let entries: [(&str, &str); 6] = [
             ("C", &self.country),
             ("O", &self.org),
             ("OU", &self.org_unit),
+            ("title", &self.title),
             ("CN", &self.cn),
             ("emailAddress", &self.email),
         ];
@@ -707,51 +836,242 @@ pub enum VerifyOutcome {
     /// The signature is mathematically valid, but the signer chain could
     /// not be traced to any certificate in the database.
     SignatureOnly,
+    /// The signature does not verify (bad digest, wrong file, corrupt).
+    Invalid,
+}
+
+/// Where a certificate shown in the verification report comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainSource {
+    /// The signing certificate itself.
+    Signer,
+    /// Embedded in the CMS SignedData alongside the signature.
+    Signature,
+    /// Loaded from the database (a trust anchor candidate).
+    Database,
+}
+
+/// One certificate in a signer's chain.
+pub struct ChainLink {
+    pub cert: X509,
+    pub source: ChainSource,
+    /// Byte-equal to one of the database certificates.
+    pub in_db: bool,
+}
+
+/// Full result of a CMS verification, for the report dialog.
+pub struct VerifyReport {
+    pub outcome: VerifyOutcome,
+    /// Failure text when the outcome is `Invalid`.
+    pub error: Option<String>,
+    /// True when the content travels next to the signature (`.p7m`).
+    pub detached: bool,
+    /// Signer certificates in signature order.
+    pub signers: Vec<X509>,
+    /// One chain per signer (index-aligned); the chain starts with the
+    /// signer itself.
+    pub chains: Vec<Vec<ChainLink>>,
+    /// Index-aligned: the chain stopped before a self-signed root because
+    /// the issuer was found neither in the database nor in the signature.
+    pub incomplete: Vec<bool>,
 }
 
 /// Verify a CMS signature. `detached_data` is the original file for a
 /// detached signature (ignored for attached ones); `anchors` — typically
 /// all certificates from the database — build the trust store. Falls back
 /// to a signature-only check when the chain cannot be established.
+#[allow(dead_code)] // thin test-facing wrapper over the detailed report
 pub fn verify_signature(
     sig: &[u8],
     detached_data: Option<&[u8]>,
     anchors: &[X509],
 ) -> Result<VerifyOutcome, String> {
-    let mut cms =
-        CmsContentInfo::from_der(sig).map_err(|e| format!("Not a CMS signature: {e}"))?;
-    let mut store_builder = openssl::x509::store::X509StoreBuilder::new().map_err(err)?;
-    for c in anchors {
-        let _ = store_builder.add_cert(c.clone());
+    let report = verify_signature_detailed(sig, detached_data, anchors);
+    match report.outcome {
+        VerifyOutcome::Invalid => Err(report.error.unwrap_or_else(|| "Verification failed".into())),
+        outcome => Ok(outcome),
     }
-    // CMS_verify would otherwise demand the S/MIME-signing purpose
-    // (emailProtection) from the signer — an ordinary TLS certificate
-    // would then fail chain validation and land in the "signer not in
-    // the database" fallback despite a complete chain. Purpose ANY keeps
-    // the full chain and validity checks.
-    store_builder
-        .set_purpose(openssl::x509::X509PurposeId::ANY)
-        .map_err(err)?;
-    let store = store_builder.build();
+}
+
+/// Verify plus introspect: signer certificates and their best-effort
+/// chains (embedded certificates + database anchors) for the report UI.
+/// Never fails — parse and verify errors become `VerifyOutcome::Invalid`.
+pub fn verify_signature_detailed(
+    sig: &[u8],
+    detached_data: Option<&[u8]>,
+    anchors: &[X509],
+) -> VerifyReport {
+    let mut report = VerifyReport {
+        outcome: VerifyOutcome::Invalid,
+        error: None,
+        detached: detached_data.is_some(),
+        signers: Vec::new(),
+        chains: Vec::new(),
+        incomplete: Vec::new(),
+    };
+
+    let parsed = CmsContentInfo::from_der(sig);
+    let mut cms = match parsed {
+        Ok(c) => c,
+        Err(e) => {
+            report.error = Some(format!("Not a CMS signature: {e}"));
+            return report;
+        }
+    };
+    let mut store_builder = openssl::x509::store::X509StoreBuilder::new().ok();
+    if let Some(sb) = store_builder.as_mut() {
+        for c in anchors {
+            let _ = sb.add_cert(c.clone());
+        }
+        // CMS_verify would otherwise demand the S/MIME-signing purpose
+        // (emailProtection) from the signer — an ordinary TLS certificate
+        // would then fail chain validation and land in the "signer not in
+        // the database" fallback despite a complete chain. Purpose ANY
+        // keeps the full chain and validity checks.
+        let _ = sb.set_purpose(openssl::x509::X509PurposeId::ANY);
+    }
+    let store = store_builder.map(|sb| sb.build());
     let strict = cms.verify(
         None,
-        Some(store.as_ref()),
+        store.as_deref(),
         detached_data,
         None,
         CMSOptions::BINARY,
     );
-    if strict.is_ok() {
-        return Ok(VerifyOutcome::Trusted);
+    let outcome = if strict.is_ok() {
+        Ok(VerifyOutcome::Trusted)
+    } else {
+        cms.verify(
+            None,
+            None,
+            detached_data,
+            None,
+            CMSOptions::BINARY | CMSOptions::NO_SIGNER_CERT_VERIFY,
+        )
+        .map(|_| VerifyOutcome::SignatureOnly)
+        .map_err(|e| format!("Signature verification failed: {e}"))
+    };
+    match outcome {
+        Ok(o) => report.outcome = o,
+        Err(e) => {
+            report.error = Some(e);
+            return report;
+        }
     }
-    cms.verify(
-        None,
-        None,
-        detached_data,
-        None,
-        CMSOptions::BINARY | CMSOptions::NO_SIGNER_CERT_VERIFY,
-    )
-    .map(|_| VerifyOutcome::SignatureOnly)
-    .map_err(|e| format!("Signature verification failed: {e}"))
+
+    // Introspection via the PKCS#7 view of the same DER: CMS SignedData
+    // produced by CMS_sign is valid PKCS#7 as well.
+    let embedded: Vec<X509> = openssl::pkcs7::Pkcs7::from_der(sig)
+        .ok()
+        .and_then(|p7| {
+            let certs = p7.signed()?.certificates()?;
+            Some((0..certs.len()).filter_map(|i| certs.get(i).map(|c| c.to_owned())).collect())
+        })
+        .unwrap_or_default();
+    let db_ders: std::collections::HashSet<Vec<u8>> = anchors
+        .iter()
+        .filter_map(|c| c.to_der().ok())
+        .collect();
+    // Chain candidates: embedded certificates first (the issuer the
+    // signer actually shipped), then the database anchors.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut candidates: Vec<(X509, bool)> = Vec::new();
+    for c in &embedded {
+        if let Some(d) = c.to_der().ok()
+            && seen.insert(d.clone())
+        {
+            candidates.push((c.clone(), db_ders.contains(&d)));
+        }
+    }
+    for c in anchors {
+        if let Some(d) = c.to_der().ok()
+            && seen.insert(d)
+        {
+            candidates.push((c.clone(), true));
+        }
+    }
+
+    let signer_stack = openssl::pkcs7::Pkcs7::from_der(sig).ok().and_then(|p7| {
+        let certs = p7.signed()?.certificates()?;
+        let flags = openssl::pkcs7::Pkcs7Flags::empty();
+        p7.signers(certs, flags).ok()
+    });
+    report.signers = signer_stack
+        .map(|s| s.iter().map(|c| c.to_owned()).collect())
+        .unwrap_or_default();
+
+    for signer in &report.signers {
+        let in_db = signer
+            .to_der()
+            .ok()
+            .is_some_and(|d| db_ders.contains(&d));
+        let (chain, incomplete) = build_chain(signer, &candidates, in_db);
+        report.chains.push(chain);
+        report.incomplete.push(incomplete);
+    }
+    report
+}
+
+/// Best-effort chain: walk issuers among the candidates, verifying each
+/// step cryptographically when the algorithm allows it (engine-backed
+/// GOST signatures cannot be verified here — fall back to name matching).
+/// Returns the chain (starting with the signer) and whether it ended
+/// before reaching a self-signed certificate.
+fn build_chain(
+    signer: &X509,
+    candidates: &[(X509, bool)],
+    signer_in_db: bool,
+) -> (Vec<ChainLink>, bool) {
+    let mut chain = vec![ChainLink {
+        cert: signer.clone(),
+        source: ChainSource::Signer,
+        in_db: signer_in_db,
+    }];
+    let mut seen: std::collections::HashSet<Vec<u8>> =
+        signer.to_der().ok().into_iter().collect();
+    let mut cur = signer.clone();
+    // Real chains are < 10 certificates; the cap only guards cycles.
+    for _ in 0..16 {
+        if name_eq(cur.issuer_name(), cur.subject_name()) {
+            return (chain, false);
+        }
+        let issuer = candidates.iter().find(|(c, _)| {
+            name_eq(c.subject_name(), cur.issuer_name()) && {
+                let Ok(pk) = c.public_key() else { return false };
+                matches!(cur.verify(pk.as_ref()), Ok(true))
+            }
+        });
+        let issuer = issuer.or_else(|| {
+            candidates
+                .iter()
+                .find(|(c, _)| name_eq(c.subject_name(), cur.issuer_name()))
+        });
+        match issuer {
+            None => return (chain, true),
+            Some((cert, in_db)) => {
+                if let Some(d) = cert.to_der().ok()
+                    && !seen.insert(d)
+                {
+                    return (chain, true);
+                }
+                cur = cert.clone();
+                chain.push(ChainLink {
+                    cert: cert.clone(),
+                    source: if *in_db {
+                        ChainSource::Database
+                    } else {
+                        ChainSource::Signature
+                    },
+                    in_db: *in_db,
+                });
+            }
+        }
+    }
+    (chain, true)
+}
+
+fn name_eq(a: &openssl::x509::X509NameRef, b: &openssl::x509::X509NameRef) -> bool {
+    unsafe { openssl_sys::X509_NAME_cmp(a.as_ptr(), b.as_ptr()) == 0 }
 }
 
 // ---- hand-assembled unencrypted PKCS#12 ----
@@ -1371,17 +1691,29 @@ pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Import
         } else if let Ok(req) = X509Req::from_der(data) {
             out.push(Imported::Req { req });
         } else if let Ok(p12) = openssl::pkcs12::Pkcs12::from_der(data) {
-            let parsed = p12
-                .parse2(password.unwrap_or(""))
-                .map_err(|e| format!("PKCS#12 parse error: {e} (wrong password?)"))?;
-            out.push(Imported::Pkcs12 {
-                key: parsed.pkey,
-                cert: parsed.cert,
-                ca: parsed
-                    .ca
-                    .map(|s| s.iter().map(|c| c.to_owned()).collect())
-                    .unwrap_or_default(),
-            });
+            match p12.parse2(password.unwrap_or("")) {
+                Ok(parsed) => out.push(Imported::Pkcs12 {
+                    key: parsed.pkey,
+                    cert: parsed.cert,
+                    ca: parsed
+                        .ca
+                        .map(|s| s.iter().map(|c| c.to_owned()).collect())
+                        .unwrap_or_default(),
+                }),
+                Err(e) => {
+                    // CryptoPro CSP packs the keybag under its vendor GOST
+                    // PBE, which OpenSSL cannot init — fall back to the
+                    // hand-rolled walker.
+                    let g = crate::cpcsp::parse_gost_pfx(data, password.unwrap_or(""))
+                        .map_err(|_| format!("PKCS#12 parse error: {e} (wrong password?)"))?;
+                    let mut certs = g.certs.into_iter();
+                    out.push(Imported::Pkcs12 {
+                        key: g.key,
+                        cert: certs.next(),
+                        ca: certs.collect(),
+                    });
+                }
+            }
         } else if let Ok(key) = PKey::private_key_from_der(data) {
             out.push(Imported::Key { key });
         } else {
@@ -1626,6 +1958,196 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signature_algorithm_labels() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let cert = build_certificate(
+            &subject("alg-rsa").build_name().unwrap(),
+            &key,
+            &key,
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert_eq!(signature_algorithm(cert.as_ref()), "SHA-256 · RSA");
+
+        let eck = generate_key(NewKeyKind::EcP256).unwrap();
+        // Signed BY an EC key (the issuer signs, the subject key only rides
+        // along) — that is what the signature algorithm describes.
+        let ec_leaf = build_certificate(
+            &subject("alg-ec").build_name().unwrap(),
+            &generate_key(NewKeyKind::Rsa2048).unwrap(),
+            eck.as_ref(),
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert_eq!(signature_algorithm(ec_leaf.as_ref()), "SHA-256 · ECDSA");
+
+        let ed = generate_key(NewKeyKind::Ed25519).unwrap();
+        let edcert = build_certificate(
+            &subject("alg-ed").build_name().unwrap(),
+            &ed,
+            &ed,
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert_eq!(signature_algorithm(edcert.as_ref()), "Ed25519");
+    }
+
+    #[test]
+    fn subject_title_lands_in_dn() {
+        let mut sd = subject("Tst");
+        sd.org = "Org".into();
+        sd.title = "Ведущий инженер".into();
+        let name = sd.build_name().unwrap();
+        assert_eq!(
+            subject_field(&name, Nid::TITLE).as_deref(),
+            Some("Ведущий инженер")
+        );
+        assert_eq!(
+            subject_field(&name, Nid::ORGANIZATIONNAME).as_deref(),
+            Some("Org")
+        );
+        let text = String::from_utf8_lossy(&name.to_der().unwrap_or_default()).to_string();
+        let _ = text;
+    }
+
+    #[test]
+    fn name_cn_extracts_common_name() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let mut sd = subject("Issuer CN Here");
+        sd.org = "Org Ltd".into();
+        let cert = build_certificate(
+            &sd.build_name().unwrap(),
+            &key,
+            &key,
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            name_cn(cert.subject_name()).as_deref(),
+            Some("Issuer CN Here")
+        );
+        assert_eq!(
+            name_cn(cert.issuer_name()).as_deref(),
+            Some("Issuer CN Here")
+        );
+
+        let leaf = build_certificate(
+            &subject("leaf.example.com").build_name().unwrap(),
+            &generate_key(NewKeyKind::EcP256).unwrap(),
+            key.as_ref(),
+            Some(cert.as_ref()),
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            name_cn(leaf.issuer_name()).as_deref(),
+            Some("Issuer CN Here")
+        );
+    }
+
+    #[test]
+    fn verify_report_signers_and_chain() {
+        let ca_key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let ca = build_certificate(
+            &subject("Report Root").build_name().unwrap(),
+            &ca_key,
+            &ca_key,
+            None,
+            &CertParams {
+                validity_days: 3650,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let leaf_key = generate_key(NewKeyKind::EcP256).unwrap();
+        let leaf = build_certificate(
+            &subject("report-leaf.example.com").build_name().unwrap(),
+            &leaf_key,
+            ca_key.as_ref(),
+            Some(ca.as_ref()),
+            &CertParams {
+                validity_days: 365,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let data = b"report payload".to_vec();
+
+        // Chain embedded, CA also in the "database": Trusted, full chain.
+        let det = sign_file(
+            leaf.as_ref(),
+            leaf_key.as_ref(),
+            &data,
+            SignatureKind::Detached,
+            std::slice::from_ref(&ca),
+        )
+        .unwrap();
+        let report = verify_signature_detailed(&det, Some(&data), std::slice::from_ref(&ca));
+        assert_eq!(report.outcome, VerifyOutcome::Trusted);
+        assert!(report.detached);
+        assert_eq!(report.signers.len(), 1);
+        assert_eq!(report.chains.len(), 1);
+        let chain = &report.chains[0];
+        assert_eq!(chain.len(), 2, "leaf → root");
+        assert_eq!(chain[0].source, ChainSource::Signer);
+        assert!(!chain[0].in_db, "only the CA was passed as an anchor");
+        assert_eq!(chain[1].source, ChainSource::Database);
+        assert!(chain[1].in_db);
+        assert!(!report.incomplete[0]);
+
+        // No anchors: still valid, chain traced through the embedded CA.
+        let report = verify_signature_detailed(&det, Some(&data), &[]);
+        assert_eq!(report.outcome, VerifyOutcome::SignatureOnly);
+        assert_eq!(report.chains[0].len(), 2);
+        assert_eq!(report.chains[0][1].source, ChainSource::Signature);
+        assert!(!report.chains[0][1].in_db);
+
+        // Tampered content: Invalid with a reason.
+        let mut bad = data.clone();
+        bad[0] ^= 1;
+        let report = verify_signature_detailed(&det, Some(&bad), std::slice::from_ref(&ca));
+        assert_eq!(report.outcome, VerifyOutcome::Invalid);
+        assert!(report.error.is_some());
+
+        // Garbage input parses to Invalid, not a panic.
+        let report = verify_signature_detailed(b"garbage", None, &[]);
+        assert_eq!(report.outcome, VerifyOutcome::Invalid);
+    }
+
+    #[test]
+    fn req_is_signed_matches_public_key() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let req = build_request(&subject("want-a-cert").build_name().unwrap(), key.as_ref())
+            .unwrap();
+        assert!(!req_is_signed(req.as_ref(), &[]));
+
+        let cert = build_certificate(
+            &subject("want-a-cert").build_name().unwrap(),
+            &key,
+            &key,
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert!(req_is_signed(req.as_ref(), std::slice::from_ref(&cert)));
+
+        let other = build_certificate(
+            &subject("other").build_name().unwrap(),
+            &generate_key(NewKeyKind::EcP256).unwrap(),
+            &generate_key(NewKeyKind::Ed25519).unwrap(),
+            None,
+            &CertParams::default(),
+        )
+        .unwrap();
+        assert!(!req_is_signed(req.as_ref(), std::slice::from_ref(&other)));
+    }
+
     /// Full GOST round trip, skipped when the gost engine is unavailable.
     #[test]
     fn gost_keygen_cert_and_cms() {
@@ -1663,6 +2185,12 @@ mod tests {
             let text = String::from_utf8_lossy(&cert.to_text().unwrap()).to_string();
             assert!(text.contains("GOST R 34.10-2012"), "{text}");
             assert!(text.contains("GOST R 34.11-2012"), "{text}");
+            let expected = if bits == 256 {
+                "Streebog-256 · GOST R 34.10-2012-256"
+            } else {
+                "Streebog-512 · GOST R 34.10-2012-512"
+            };
+            assert_eq!(signature_algorithm(cert.as_ref()), expected);
 
             // PKCS#8 storage round trip (needs the engine on load).
             let pem = key.private_key_to_pem_pkcs8().unwrap();
@@ -2079,3 +2607,4 @@ mod tests {
         assert!(same_public_key(mine2_pkey.as_ref(), expect.as_ref()));
     }
 }
+

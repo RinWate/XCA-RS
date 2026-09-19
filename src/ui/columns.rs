@@ -176,9 +176,9 @@ mod tree_probe {
             return;
         }
         let root = gtk::gio::ListStore::new::<PkiItemObject>();
-        root.append(&PkiItemObject::new(1, "CA", "s", "i", "b"));
+        root.append(&PkiItemObject::new(1, "CA", "s", "i", "b", ""));
         let kids = gtk::gio::ListStore::new::<PkiItemObject>();
-        kids.append(&PkiItemObject::new(2, "leaf", "s", "i", "b"));
+        kids.append(&PkiItemObject::new(2, "leaf", "s", "i", "b", ""));
         let children: ChildrenMap = Rc::new(RefCell::new(
             std::iter::once((1i64, kids.clone())).collect(),
         ));

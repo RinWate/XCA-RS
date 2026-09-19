@@ -27,7 +27,7 @@ pub fn open_main(app: &adw::Application, path: &Path, password: Option<String>) 
                 Ok("newcrl") => handle.new_crl_dialog(),
                 Ok("token") => handle.token_dialog(),
                 Ok("props") => handle.details_selected(),
-                _ => {}
+_ => {}
             }
         }
         Err(OpenError::WrongPassword) => {

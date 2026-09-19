@@ -56,6 +56,7 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         let cn = entry(&tr!("Common Name (CN)"));
         let org = entry(&tr!("Organization (O)"));
         let org_unit = entry(&tr!("Organizational Unit (OU)"));
+        let title = entry(&tr!("Title (T)"));
         let country = entry(&tr!("Country (C)"));
         let email = entry(&tr!("E-Mail (emailAddress)"));
         let g = form.group(&tr!("Subject"));
@@ -63,9 +64,10 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         g.add(&cn);
         g.add(&org);
         g.add(&org_unit);
+        g.add(&title);
         g.add(&country);
         g.add(&email);
-        subject_rows = Some((cn, org, org_unit, country, email));
+        subject_rows = Some((cn, org, org_unit, title, country, email));
 
         let keys = app.db.lock().unwrap().list_keys().unwrap_or_default();
         let named: Vec<(i64, String, String)> = keys
@@ -85,7 +87,6 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
             0,
         );
         let g = form.group(&tr!("Key"));
-        super::combo_min_width(&key_row, 400);
         g.add(&key_row);
         key_rows = Some((key_row, key_ids));
     }
@@ -114,7 +115,6 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         combo_ids(&tr!("Signed by"), &[tr!("Self-signed").as_str()], &cas, 0)
     };
     let g_issuer = form.group(&tr!("Issuer"));
-    super::combo_min_width(&issuer_row, 400);
     g_issuer.add(&issuer_row);
 
     let validity = spin(&tr!("Validity"), 10.0, 1.0, 1000.0, 1.0);
@@ -329,10 +329,11 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
                 (Some(r), _) => crypto::clone_name(
                     crypto::load_req(&r.pem)?.subject_name(),
                 )?,
-                (None, Some((cn, org, org_unit, country, email))) => SubjectData {
+                (None, Some((cn, org, org_unit, title, country, email))) => SubjectData {
                     cn: row_text(cn).trim().to_string(),
                     org: row_text(org).trim().to_string(),
                     org_unit: row_text(org_unit).trim().to_string(),
+                    title: row_text(title).trim().to_string(),
                     country: row_text(country).trim().to_string(),
                     email: row_text(email).trim().to_string(),
                 }
@@ -533,6 +534,7 @@ pub fn open_token(
     let cn = entry(&tr!("Common Name (CN)"));
     let org = entry(&tr!("Organization (O)"));
     let org_unit = entry(&tr!("Organizational Unit (OU)"));
+    let title = entry(&tr!("Title (T)"));
     let country = entry(&tr!("Country (C)"));
     let email = entry(&tr!("E-Mail (emailAddress)"));
 
@@ -544,6 +546,7 @@ pub fn open_token(
     g_subj.add(&cn);
     g_subj.add(&org);
     g_subj.add(&org_unit);
+    g_subj.add(&title);
     g_subj.add(&country);
     g_subj.add(&email);
 
@@ -589,6 +592,7 @@ pub fn open_token(
     let cn = cn.clone();
     let org = org.clone();
     let org_unit = org_unit.clone();
+    let title = title.clone();
     let country = country.clone();
     let email = email.clone();
     let validity = validity.clone();
@@ -599,6 +603,7 @@ pub fn open_token(
                 cn: row_text(&cn).trim().to_string(),
                 org: row_text(&org).trim().to_string(),
                 org_unit: row_text(&org_unit).trim().to_string(),
+                title: row_text(&title).trim().to_string(),
                 country: row_text(&country).trim().to_string(),
                 email: row_text(&email).trim().to_string(),
             };

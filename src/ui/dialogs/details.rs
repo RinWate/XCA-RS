@@ -58,6 +58,10 @@ pub fn open_cert(app: &App, rec: &CertRecord) {
         tr!("valid for %{count} days", count = s.expires_days)
     };
     g.add(&action_row(&tr!("Validity"), &expiry));
+    g.add(&action_row(
+        &tr!("Signature Algorithm"),
+        &crypto::signature_algorithm(cert.as_ref()),
+    ));
     g.add(&action_row(&tr!("Status"), &crypto::cert_status(&s)));
 
     // Subject Alt Names, one row per entry (same prefixes as the SAN editor).

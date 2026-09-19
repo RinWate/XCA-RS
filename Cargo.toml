@@ -1,6 +1,6 @@
 [package]
 name = "xca-rs"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "XCA (X Certificate and Key Management) rewritten in Rust with GTK4 + libadwaita"
 license = "GPL-2.0-or-later"
@@ -14,3 +14,6 @@ foreign-types = "0.3"
 cryptoki = "0.12"
 rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher"] }
 rust-i18n = "4.2.2"
+lopdf = "0.45.0"
+flate2 = "1.1.10"
+poppler-rs = "0.26.0"
