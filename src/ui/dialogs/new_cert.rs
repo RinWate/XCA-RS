@@ -2,7 +2,7 @@
 //! (prefilled from a CSR when signing), key choice, issuer CA, validity and
 //! common extension presets.
 
-use super::{action_row, combo_ids, entry, entry_default, error_dialog, form_dialog, row_text, spin, switch};
+use super::{action_row, combo, combo_ids, entry, entry_default, error_dialog, form_dialog, row_text, spin, switch};
 use crate::app::App;
 use crate::crypto::{self, CertParams, SubjectData};
 use crate::db::{CertRecord, ReqRecord};
@@ -113,9 +113,20 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
     let g_issuer = form.group(&tr!("Issuer"));
     g_issuer.add(&issuer_row);
 
-    let validity = spin(&tr!("Validity (days)"), 3650.0, 1.0, 36500.0, 1.0);
+    let validity = spin(&tr!("Validity"), 10.0, 1.0, 1000.0, 1.0);
+    let unit_row = combo(
+        &tr!("Validity Unit"),
+        &[
+            tr!("Days").as_str(),
+            tr!("Weeks").as_str(),
+            tr!("Months").as_str(),
+            tr!("Years").as_str(),
+        ],
+        3,
+    );
     let g_val = form.group(&tr!("Validity"));
     g_val.add(&validity);
+    g_val.add(&unit_row);
 
     let ca_sw = switch(
         &tr!("Certificate Authority (CA)"),
@@ -128,6 +139,53 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
         from_req.is_some(),
     );
     let client_sw = switch(&tr!("TLS Client"), "clientAuth", false);
+
+    // basicConstraints pathlen (only meaningful for CAs).
+    let path_row = combo(
+        &tr!("CA Path Length"),
+        &[
+            tr!("Unlimited").as_str(),
+            "0",
+            "1",
+            "2",
+            "3",
+        ],
+        0,
+    );
+    path_row.set_subtitle("basicConstraints pathlen");
+    {
+        let path_row = path_row.clone();
+        ca_sw.connect_notify_local(Some("active"), move |sw: &adw::SwitchRow, _| {
+            path_row.set_sensitive(sw.is_active());
+        });
+    }
+    path_row.set_sensitive(from_req.is_none());
+
+    // Extra extended-key-usage purposes, collapsed by default.
+    let code_sw = switch(&tr!("Code Signing"), "codeSigning", false);
+    let mail_sw = switch(&tr!("E-Mail Protection"), "emailProtection", false);
+    let stamp_sw = switch(&tr!("Time Stamping"), "timeStamping", false);
+    let ocsp_sw = switch(&tr!("OCSP Signing"), "OCSPSigning", false);
+    let eku_row = adw::ExpanderRow::builder()
+        .title(tr!("Extended Key Usage"))
+        .build();
+    eku_row.add_row(&code_sw);
+    eku_row.add_row(&mail_sw);
+    eku_row.add_row(&stamp_sw);
+    eku_row.add_row(&ocsp_sw);
+
+    // Where relying parties fetch the CRL and the CA certificate.
+    // Bare URLs are accepted and wrapped into the RFC 5280 forms.
+    let crl_row = entry(&tr!("CRL Distribution Point (URL)"));
+    let ocsp_row = entry(&tr!("OCSP Responder (URL)"));
+    let issuers_row = entry(&tr!("CA Certificates (URL)"));
+    let urls_row = adw::ExpanderRow::builder()
+        .title(tr!("CRL & OCSP Endpoints"))
+        .build();
+    urls_row.add_row(&crl_row);
+    urls_row.add_row(&ocsp_row);
+    urls_row.add_row(&issuers_row);
+
     // SAN entries live in a shared cell; the row subtitle summarizes them
     // and the editor dialog updates them in place.
     let initial_san: Vec<SanEntry> = req_info
@@ -162,8 +220,11 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
     }
     let g_ext = form.group(&tr!("Extensions"));
     g_ext.add(&ca_sw);
+    g_ext.add(&path_row);
     g_ext.add(&server_sw);
     g_ext.add(&client_sw);
+    g_ext.add(&eku_row);
+    g_ext.add(&urls_row);
     g_ext.add(&san_row);
 
     // Self-signed implies CA by default; signing by a CA implies a leaf.
@@ -194,18 +255,68 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
     let issuer_row = issuer_row.clone();
     let issuer_ids = issuer_ids.clone();
     let validity = validity.clone();
+    let unit_row = unit_row.clone();
     let ca_sw = ca_sw.clone();
     let server_sw = server_sw.clone();
     let client_sw = client_sw.clone();
+    let path_row = path_row.clone();
+    let code_sw = code_sw.clone();
+    let mail_sw = mail_sw.clone();
+    let stamp_sw = stamp_sw.clone();
+    let ocsp_sw = ocsp_sw.clone();
+    let crl_row = crl_row.clone();
+    let ocsp_row = ocsp_row.clone();
+    let issuers_row = issuers_row.clone();
     let san = san.clone();
     let req_rec = from_req.clone();
+    let hook_subject = subject_rows.clone();
+    let hook_issuer = issuer_row.clone();
+    let hook_create = create.clone();
     create.connect_clicked(move |_| {
         let result = (|| -> Result<(), String> {
             let params = CertParams {
-                validity_days: validity.value() as u32,
+                validity_days: crypto::validity_days(
+                    validity.value() as u32,
+                    crypto::ValidityUnit::from_combo(unit_row.selected()),
+                ),
                 is_ca: ca_sw.is_active(),
                 server_auth: server_sw.is_active(),
                 client_auth: client_sw.is_active(),
+                code_signing: code_sw.is_active(),
+                email_protection: mail_sw.is_active(),
+                time_stamping: stamp_sw.is_active(),
+                ocsp_signing: ocsp_sw.is_active(),
+                path_len: match path_row.selected() {
+                    1 => Some(0),
+                    2 => Some(1),
+                    3 => Some(2),
+                    4 => Some(3),
+                    _ => None,
+                },
+                crl_dp: {
+                    let url = row_text(&crl_row).trim().to_string();
+                    if url.is_empty() {
+                        Vec::new()
+                    } else if url.starts_with("URI:") {
+                        vec![url]
+                    } else {
+                        vec![format!("URI:{url}")]
+                    }
+                },
+                aia: [
+                    (row_text(&ocsp_row).trim().to_string(), "OCSP"),
+                    (row_text(&issuers_row).trim().to_string(), "caIssuers"),
+                ]
+                .into_iter()
+                .filter(|(url, _)| !url.is_empty())
+                .map(|(url, prefix)| {
+                    if url.contains(';') {
+                        url
+                    } else {
+                        format!("{prefix};URI:{url}")
+                    }
+                })
+                .collect(),
                 san: san.borrow().iter().map(|e| e.to_raw()).collect(),
             };
 
@@ -388,6 +499,17 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
             Err(e) => error_dialog(&app2.window, &e),
         }
     });
+
+    // Hidden UI-test hook: fill the form as "leaf signed by the first CA"
+    // and run the real create handler.
+    if std::env::var("XCA_UI_TEST").as_deref() == Ok("signbyca") {
+        if let Some((cn, ..)) = hook_subject.as_ref() {
+            gtk::prelude::EditableExt::set_text(cn, "leaf.example.com");
+        }
+        hook_issuer.set_selected(1);
+        hook_create.emit_clicked();
+        return;
+    }
 
     form.dlg.present(Some(&app.window));
 }

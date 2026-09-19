@@ -184,7 +184,6 @@
 "Public Key" = "Открытый ключ"
 "Revocation List Properties" = "Свойства списка отзыва"
 "Last Update" = "Последнее обновление"
-"serial 0x%{serial}  revoked %{date}" = "серийный номер 0x%{serial}  отозван %{date}"
 "(no revoked certificates)" = "(нет отозванных сертификатов)"
 "Revoked Certificates" = "Отозванные сертификаты"
 
@@ -243,3 +242,21 @@
 "Encryption" = "Шифрование"
 "Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token." = "Внимание: CA, созданный на токене, пока не может выпускать сертификаты и CRL из xca-rs — его закрытый ключ никогда не покидает токен."
 
+
+"CA Path Length" = "Длина цепочки УЦ"
+"Unlimited" = "Не ограничена"
+"Extended Key Usage" = "Расширенное использование ключа"
+"Code Signing" = "Подписывание кода"
+"E-Mail Protection" = "Защита электронной почты"
+"Time Stamping" = "Штампы времени"
+"OCSP Signing" = "Подписывание OCSP"
+"CRL & OCSP Endpoints" = "Адреса CRL и OCSP"
+"CRL Distribution Point (URL)" = "Точка распространения CRL (URL)"
+"OCSP Responder (URL)" = "OCSP-респондер (URL)"
+"CA Certificates (URL)" = "Сертификаты УЦ (URL)"
+
+"Validity Unit" = "Тип срока"
+"Days" = "Дни"
+"Weeks" = "Недели"
+"Months" = "Месяцы"
+"Years" = "Годы"

@@ -180,7 +180,10 @@ pub fn open_crl(app: &App, rec: &crate::db::CrlRecord) {
     ));
     g.add(&action_row(&tr!("Revoked entries"), &rec.entries.to_string()));
 
-    let mut text = String::new();
+    // One row per revoked certificate: serial as the title, revocation
+    // date and reason (CRL entry extension) as the subtitle.
+    let g2 = form.group(&tr!("Revoked Certificates"));
+    let mut any = false;
     if let Some(stack) = crl.get_revoked() {
         for rev in stack.iter() {
             let serial = rev
@@ -190,19 +193,23 @@ pub fn open_crl(app: &App, rec: &crate::db::CrlRecord) {
                 .and_then(|b| b.to_hex_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "?".into());
-            text.push_str(&tr!(
-                "serial 0x%{serial}  revoked %{date}",
-                serial = serial,
-                date = rev.revocation_date().to_string()
-            ));
-            text.push('\n');
+            let reason = rev
+                .extension::<openssl::x509::ReasonCode>()
+                .ok()
+                .flatten()
+                .and_then(|(_, e)| e.get_i64().ok())
+                .map(crate::xca_format::reason_name);
+            let subtitle = match reason {
+                Some(r) => format!("{} · {}", rev.revocation_date(), r),
+                None => rev.revocation_date().to_string(),
+            };
+            g2.add(&action_row(&format!("0x{serial}"), &subtitle));
+            any = true;
         }
     }
-    if text.is_empty() {
-        text = tr!("(no revoked certificates)");
+    if !any {
+        g2.add(&action_row(&tr!("(no revoked certificates)"), ""));
     }
-    let g2 = form.group(&tr!("Revoked Certificates"));
-    g2.add(&text_block(&text));
 
     let close = form.close_button(&tr!("Close"));
     {

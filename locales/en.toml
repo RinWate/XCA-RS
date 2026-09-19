@@ -184,7 +184,6 @@
 "Public Key" = "Public Key"
 "Revocation List Properties" = "Revocation List Properties"
 "Last Update" = "Last Update"
-"serial 0x%{serial}  revoked %{date}" = "serial 0x%{serial}  revoked %{date}"
 "(no revoked certificates)" = "(no revoked certificates)"
 "Revoked Certificates" = "Revoked Certificates"
 
@@ -243,3 +242,21 @@
 "Encryption" = "Encryption"
 "Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token." = "Note: a CA created on a token cannot yet issue certificates or CRLs from xca-rs — its private key never leaves the token."
 
+
+"CA Path Length" = "CA Path Length"
+"Unlimited" = "Unlimited"
+"Extended Key Usage" = "Extended Key Usage"
+"Code Signing" = "Code Signing"
+"E-Mail Protection" = "E-Mail Protection"
+"Time Stamping" = "Time Stamping"
+"OCSP Signing" = "OCSP Signing"
+"CRL & OCSP Endpoints" = "CRL & OCSP Endpoints"
+"CRL Distribution Point (URL)" = "CRL Distribution Point (URL)"
+"OCSP Responder (URL)" = "OCSP Responder (URL)"
+"CA Certificates (URL)" = "CA Certificates (URL)"
+
+"Validity Unit" = "Unit"
+"Days" = "Days"
+"Weeks" = "Weeks"
+"Months" = "Months"
+"Years" = "Years"

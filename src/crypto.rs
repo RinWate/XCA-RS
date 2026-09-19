@@ -305,6 +305,62 @@ impl SubjectData {
 
 }
 
+/// Unit for the validity picker in the New Certificate dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidityUnit {
+    Days,
+    Weeks,
+    Months,
+    Years,
+}
+
+impl ValidityUnit {
+    /// Index in the dialog's unit combo.
+    pub fn from_combo(idx: u32) -> Self {
+        match idx {
+            0 => ValidityUnit::Days,
+            1 => ValidityUnit::Weeks,
+            2 => ValidityUnit::Months,
+            _ => ValidityUnit::Years,
+        }
+    }
+}
+
+/// Days from today until the date advanced by `count` units. Months and
+/// years follow the calendar, so "1 year" keeps the same date across leap
+/// years and "Jan 31 + 1 month" lands on the last day of February.
+pub fn validity_days(count: u32, unit: ValidityUnit) -> u32 {
+    validity_days_at(crate::xca_format::today_days(), count, unit)
+}
+
+fn validity_days_at(today: i64, count: u32, unit: ValidityUnit) -> u32 {
+    use crate::xca_format as xf;
+    let n = count as i64;
+    let target = match unit {
+        ValidityUnit::Days => today + n,
+        ValidityUnit::Weeks => today + n * 7,
+        ValidityUnit::Months | ValidityUnit::Years => {
+            let (y, m, d) = xf::civil_from_days(today);
+            let months = if matches!(unit, ValidityUnit::Years) {
+                n * 12
+            } else {
+                n
+            };
+            let total = y * 12 + (m - 1) + months;
+            let (y2, m2) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+            let leap = y2 % 4 == 0 && (y2 % 100 != 0 || y2 % 400 == 0);
+            let dim = match m2 {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if leap => 29,
+                _ => 28,
+            };
+            xf::days_from_civil(y2, m2, d.min(dim))
+        }
+    };
+    (target - today).max(1) as u32
+}
+
 /// Parameters for `build_certificate`.
 #[derive(Clone, Debug, Default)]
 pub struct CertParams {
@@ -312,12 +368,150 @@ pub struct CertParams {
     pub is_ca: bool,
     pub server_auth: bool,
     pub client_auth: bool,
+    pub code_signing: bool,
+    pub email_protection: bool,
+    pub time_stamping: bool,
+    pub ocsp_signing: bool,
+    /// basicConstraints pathlen for CA certificates; None = unlimited.
+    pub path_len: Option<u32>,
+    /// Raw crlDistributionPoints values, e.g. "URI:http://ca.example/crl.pem".
+    pub crl_dp: Vec<String>,
+    /// Raw authorityInfoAccess values,
+    /// e.g. "OCSP;URI:http://ocsp.example" or "caIssuers;URI:http://...".
+    pub aia: Vec<String>,
     /// Raw SAN items, e.g. "DNS:example.com", "IP:10.0.0.1", "email:a@b.c".
     pub san: Vec<String>,
 }
 
+// ---- hand-assembled unencrypted PKCS#12 ----
+//
+// PKCS12_create always encrypts the bags and adds an integrity MAC, even
+// with an empty or NULL password — such a file still makes every importer
+// prompt for a password (Enter works). A truly password-free PFX keeps the
+// safe bags as plain `data` ContentInfos and omits MacData, which is what
+// these helpers build (RFC 7292 allows both).
+
+fn der_concat(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// DER OBJECT IDENTIFIER from arcs, e.g. PKCS#7 data 1.2.840.113549.1.7.1.
+fn der_oid(arcs: &[u64]) -> Vec<u8> {
+    let mut body = vec![(40 * arcs[0] + arcs[1]) as u8];
+    for &a in &arcs[2..] {
+        let mut chunk = [0u8; 10];
+        let mut n = 0;
+        let mut v = a;
+        loop {
+            chunk[n] = (v & 0x7f) as u8;
+            v >>= 7;
+            n += 1;
+            if v == 0 {
+                break;
+            }
+        }
+        for i in (0..n).rev() {
+            body.push(chunk[i] | if i == 0 { 0 } else { 0x80 });
+        }
+    }
+    der_tlv(0x06, &body)
+}
+
+/// PKCS#9 friendlyName attribute (BMPString / UTF-16BE) as bagAttributes.
+fn friendly_name_attr(name: &str) -> Vec<u8> {
+    let mut bmp = Vec::new();
+    for u in name.encode_utf16() {
+        bmp.extend_from_slice(&u.to_be_bytes());
+    }
+    let attr = der_tlv(
+        0x30,
+        &der_concat(&[
+            der_oid(&[1, 2, 840, 113549, 1, 9, 20]),
+            der_tlv(0x31, &der_tlv(0x1e, &bmp)),
+        ]),
+    );
+    der_tlv(0x31, &attr)
+}
+
+/// SafeBag ::= SEQUENCE { bagId OID, bagValue [0] EXPLICIT, attributes? }.
+fn safe_bag(bag_id: Vec<u8>, value: Vec<u8>, name: &str) -> Vec<u8> {
+    let mut parts = vec![bag_id, der_tlv(0xa0, &value)];
+    if !name.is_empty() {
+        parts.push(friendly_name_attr(name));
+    }
+    der_tlv(0x30, &der_concat(&parts))
+}
+
+/// CertBag with an X.509 certificate.
+fn cert_bag_der(cert: &X509Ref) -> Vec<u8> {
+    let der = cert.to_der().unwrap_or_default();
+    der_tlv(
+        0x30,
+        &der_concat(&[
+            der_oid(&[1, 2, 840, 113549, 1, 9, 22, 1]),
+            der_tlv(0xa0, &der_tlv(0x04, &der)),
+        ]),
+    )
+}
+
+/// A `data` ContentInfo wrapping raw payload bytes.
+fn p12_data_info(payload: &[u8]) -> Vec<u8> {
+    der_tlv(
+        0x30,
+        &der_concat(&[
+            der_oid(&[1, 2, 840, 113549, 1, 7, 1]),
+            der_tlv(0xa0, &der_tlv(0x04, payload)),
+        ]),
+    )
+}
+
+/// The unencrypted PFX itself: key bag (plain PKCS#8) and certificate bags
+/// as plain data, no MacData.
+fn build_pkcs12_plain(
+    key: &PKeyRef<Private>,
+    cert: &X509Ref,
+    chain: &[X509],
+    friendly_name: &str,
+) -> CryptoResult<Vec<u8>> {
+    let pkcs8 = key.private_key_to_pkcs8().map_err(err)?;
+    let key_contents = der_tlv(
+        0x30,
+        &safe_bag(der_oid(&[1, 2, 840, 113549, 1, 12, 10, 1, 1]), pkcs8, friendly_name),
+    );
+
+    let mut cert_bags = vec![safe_bag(
+        der_oid(&[1, 2, 840, 113549, 1, 12, 10, 1, 3]),
+        cert_bag_der(cert),
+        friendly_name,
+    )];
+    for c in chain {
+        cert_bags.push(safe_bag(
+            der_oid(&[1, 2, 840, 113549, 1, 12, 10, 1, 3]),
+            cert_bag_der(c),
+            "",
+        ));
+    }
+    let cert_contents = der_tlv(0x30, &der_concat(&cert_bags));
+
+    let auth_safe = der_tlv(
+        0x30,
+        &der_concat(&[p12_data_info(&key_contents), p12_data_info(&cert_contents)]),
+    );
+    let pfx = der_tlv(
+        0x30,
+        &der_concat(&[der_tlv(0x02, &[3]), p12_data_info(&auth_safe)]),
+    );
+    Ok(pfx)
+}
+
 /// Bundle a certificate (plus its private key and optional CA chain) into a
 /// password-protected PKCS#12 / PFX file, like XCA's "PKCS#12" export.
+/// An empty password produces a completely unencrypted PFX that importers
+/// open without any password prompt.
 pub fn build_pkcs12(
     cert: &X509Ref,
     key: &PKeyRef<Private>,
@@ -325,6 +519,9 @@ pub fn build_pkcs12(
     password: &str,
     friendly_name: &str,
 ) -> CryptoResult<Vec<u8>> {
+    if password.is_empty() {
+        return build_pkcs12_plain(key, cert, chain, friendly_name);
+    }
     let mut builder = Pkcs12::builder();
     if !chain.is_empty() {
         let mut stack = Stack::new().map_err(err)?;
@@ -447,7 +644,11 @@ pub fn cert_builder<P: HasPublic>(
     }
 
     if params.is_ca {
-        add_ext(&mut b, issuer_cert, "basicConstraints", "CA:TRUE", true)?;
+        let bc = match params.path_len {
+            Some(n) => format!("CA:TRUE,pathlen:{n}"),
+            None => "CA:TRUE".to_string(),
+        };
+        add_ext(&mut b, issuer_cert, "basicConstraints", &bc, true)?;
         add_ext(
             &mut b,
             issuer_cert,
@@ -473,8 +674,39 @@ pub fn cert_builder<P: HasPublic>(
     if params.client_auth {
         eku.push("clientAuth");
     }
+    if params.code_signing {
+        eku.push("codeSigning");
+    }
+    if params.email_protection {
+        eku.push("emailProtection");
+    }
+    if params.time_stamping {
+        eku.push("timeStamping");
+    }
+    if params.ocsp_signing {
+        eku.push("OCSPSigning");
+    }
     if !eku.is_empty() {
         add_ext(&mut b, issuer_cert, "extendedKeyUsage", &eku.join(","), false)?;
+    }
+
+    if !params.crl_dp.is_empty() {
+        add_ext(
+            &mut b,
+            issuer_cert,
+            "crlDistributionPoints",
+            &params.crl_dp.join(","),
+            false,
+        )?;
+    }
+    if !params.aia.is_empty() {
+        add_ext(
+            &mut b,
+            issuer_cert,
+            "authorityInfoAccess",
+            &params.aia.join(","),
+            false,
+        )?;
     }
 
     let san: Vec<&str> = params
@@ -818,6 +1050,112 @@ mod tests {
             if kind == NewKeyKind::EcP256 {
                 assert_eq!(curve, "P-256");
             }
+        }
+    }
+
+    #[test]
+    fn cert_extensions_full_set() {
+        let ca_key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let ca_name = subject("Ext Root").build_name().unwrap();
+        let ca = build_certificate(
+            &ca_name,
+            &ca_key,
+            &ca_key,
+            None,
+            &CertParams {
+                validity_days: 3650,
+                is_ca: true,
+                path_len: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ca_text = String::from_utf8_lossy(&ca.to_text().unwrap()).to_string();
+        assert!(ca_text.contains("pathlen:1"));
+
+        let leaf_key = generate_key(NewKeyKind::EcP256).unwrap();
+        let leaf = build_certificate(
+            &subject("ext.example.com").build_name().unwrap(),
+            &leaf_key,
+            &ca_key,
+            Some(&ca),
+            &CertParams {
+                validity_days: 365,
+                code_signing: true,
+                email_protection: true,
+                time_stamping: true,
+                ocsp_signing: true,
+                crl_dp: vec!["URI:http://ca.example/crl.pem".into()],
+                aia: vec![
+                    "OCSP;URI:http://ocsp.example".into(),
+                    "caIssuers;URI:http://ca.example/ca.pem".into(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(leaf.verify(ca.public_key().unwrap().as_ref()).unwrap());
+        let text = String::from_utf8_lossy(&leaf.to_text().unwrap()).to_string();
+        assert!(text.contains("Code Signing"));
+        assert!(text.contains("E-mail Protection"));
+        assert!(text.contains("Time Stamping"));
+        assert!(text.contains("OCSP Signing"));
+        assert!(text.contains("http://ca.example/crl.pem"));
+        assert!(text.contains("http://ocsp.example"));
+        assert!(text.contains("http://ca.example/ca.pem"));
+    }
+
+    #[test]
+    fn pkcs12_without_password_is_plain() {
+        let key = generate_key(NewKeyKind::Rsa2048).unwrap();
+        let name = subject("PlainP12").build_name().unwrap();
+        let cert = build_certificate(
+            &name,
+            &key,
+            &key,
+            None,
+            &CertParams {
+                validity_days: 30,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ca = cert.clone();
+        let der = build_pkcs12(cert.as_ref(), key.as_ref(), std::slice::from_ref(&ca), "", "plain")
+            .unwrap();
+        // No password anywhere: parse with an empty one and get everything back.
+        let parsed = Pkcs12::from_der(&der).unwrap().parse2("").unwrap();
+        assert!(parsed.cert.is_some());
+        assert!(parsed.pkey.is_some());
+        assert!(same_public_key(parsed.pkey.as_ref().unwrap(), key.as_ref()));
+        assert_eq!(parsed.ca.as_ref().map(|s| s.len()).unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn validity_units_calendar_math() {
+        use crate::xca_format as xf;
+        // Jan 31 + 1 month → Feb 29 in a leap year = 29 days later.
+        let jan31 = xf::days_from_civil(2024, 1, 31);
+        assert_eq!(validity_days_at(jan31, 1, ValidityUnit::Months), 29);
+        // Feb 29 2024 + 1 year clamps to Feb 28 2025 = 365 days.
+        let feb29 = xf::days_from_civil(2024, 2, 29);
+        assert_eq!(validity_days_at(feb29, 1, ValidityUnit::Years), 365);
+        // A year spanning Feb 29 has 366 days, the next one 365.
+        assert_eq!(
+            validity_days_at(xf::days_from_civil(2023, 3, 1), 1, ValidityUnit::Years),
+            366
+        );
+        assert_eq!(
+            validity_days_at(xf::days_from_civil(2024, 3, 1), 1, ValidityUnit::Years),
+            365
+        );
+        assert_eq!(validity_days_at(0, 2, ValidityUnit::Weeks), 14);
+        assert_eq!(validity_days_at(0, 30, ValidityUnit::Days), 30);
+        // civil ⇄ days round-trip
+        for z in [0i64, 1, 19723, 20000, 25000] {
+            let (y, m, d) = xf::civil_from_days(z);
+            assert_eq!(xf::days_from_civil(y, m, d), z);
         }
     }
 

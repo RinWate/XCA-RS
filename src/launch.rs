@@ -23,6 +23,7 @@ pub fn open_main(app: &adw::Application, path: &Path, password: Option<String>) 
             match std::env::var("XCA_UI_TEST").as_deref() {
                 Ok("newkey") => handle.new_key_dialog(),
                 Ok("newcert") => handle.new_cert_dialog(),
+                Ok("signbyca") => handle.new_cert_dialog(),
                 Ok("newcrl") => handle.new_crl_dialog(),
                 Ok("token") => handle.token_dialog(),
                 Ok("props") => handle.details_selected(),

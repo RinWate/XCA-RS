@@ -163,7 +163,13 @@ impl Db {
         }
 
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // The original XCA never enables SQLite foreign-key enforcement, so
+        // neither do we: real databases migrated through old XCA versions
+        // keep legacy tables (e.g. "revoked") whose FK definitions do not
+        // match the v8 schema, and with the pragma on every DELETE FROM
+        // certs fails with "foreign key mismatch". Referential cleanup is
+        // done in code, like in XCA itself.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
         if !fresh && !is_xca_schema(&conn)? {
             return Err(OpenError::Other(tr!("Not an XCA database")));
         }
@@ -1319,6 +1325,27 @@ mod tests {
         assert!(db.revoked_serials_by_ca().unwrap().is_empty());
     }
 
+    /// Real XCA databases migrated through old program versions keep a
+    /// legacy "revoked" table whose FK references certs(item); certs has no
+    /// unique index on item, so SQLite raises "foreign key mismatch" on
+    /// DELETE FROM certs as soon as foreign-key enforcement is on. Deleting
+    /// a certificate must work in such a database (original XCA never turns
+    /// the pragma on).
+    #[test]
+    fn delete_cert_tolerates_legacy_revoked_table() {
+        let db = Db::open(&tmpdir("legacy").join("legacy.xdb"), None).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE revoked(ca INTEGER, serial TEXT, \
+                 FOREIGN KEY(ca) REFERENCES certs(item));",
+            )
+            .unwrap();
+        let (_, _, ca_pem) = ca_cert();
+        let ca_id = db.insert_cert(&ca_record(ca_pem.clone())).unwrap();
+        db.delete_cert(ca_id).unwrap();
+        assert!(!db.cert_exists(&ca_pem).unwrap());
+    }
+
     /// The file xca-rs creates must be a faithful XCA database: same
     /// tables, base64-DER blobs, hashes and unlockable private keys.
     #[test]
@@ -1675,6 +1702,55 @@ mod tests {
             .unwrap();
         // link the leaf to its issuer so the UI tree has a hierarchy
         db.set_cert_refs(leaf_id, None, Some(ca_id)).unwrap();
+        eprintln!("written: {}", path.display());
+    }
+
+    /// Probe mirroring the user's signing scenario: a password-protected
+    /// database with a CA whose private key is linked to it, so the CA
+    /// shows up in the "Signed by" combo of the New Certificate dialog.
+    #[test]
+    fn make_sign_probe_db() {
+        let path = std::path::PathBuf::from("/tmp/xca-sign-probe.xdb");
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path, None).unwrap();
+        let key = crypto::generate_key(NewKeyKind::Rsa2048).unwrap();
+        let name = SubjectData {
+            cn: "Sign Root".into(),
+            ..Default::default()
+        }
+        .build_name()
+        .unwrap();
+        let ca = crypto::build_certificate(
+            &name,
+            &key,
+            &key,
+            None,
+            &CertParams {
+                validity_days: 3650,
+                is_ca: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let key_id = db
+            .insert_key("sign root key", &key.private_key_to_pem_pkcs8().unwrap())
+            .unwrap();
+        let ca_id = db
+            .insert_cert(&CertRecord {
+                id: 0,
+                name: "Sign Root".into(),
+                subject: String::new(),
+                issuer: String::new(),
+                serial: String::new(),
+                not_after: String::new(),
+                expires_days: 0,
+                ca: true,
+                key_id: None,
+                issuer_id: None,
+                pem: ca.to_pem().unwrap(),
+            })
+            .unwrap();
+        db.set_cert_refs(ca_id, Some(key_id), None).unwrap();
         eprintln!("written: {}", path.display());
     }
 }

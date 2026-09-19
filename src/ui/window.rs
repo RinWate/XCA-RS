@@ -144,21 +144,28 @@ fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate
 }
 
 impl Pages {
-    /// Ids of CA rows the user has collapsed (rows with children).
+    /// Ids of CA rows the user has collapsed. Childless rows never count:
+    /// they are "not expanded" simply because there is nothing to expand,
+    /// and treating them as collapsed made a freshly-parented CA collapse
+    /// (and shrink the model) on the next rebuild.
     pub fn certs_tree_collapsed(&self) -> std::collections::HashSet<i64> {
         let mut out = std::collections::HashSet::new();
         for i in 0..self.certs_tree.n_items() {
-            let Ok(row) = self.certs_tree.item(i).unwrap().downcast::<gtk::TreeListRow>() else {
-                continue;
-            };
-            let Some(id) = row
-                .item()
-                .and_then(|o| o.downcast::<PkiItemObject>().ok())
-                .map(|o| o.id())
+            let Some(row) = self
+                .certs_tree
+                .item(i)
+                .and_then(|o| o.downcast::<gtk::TreeListRow>().ok())
             else {
                 continue;
             };
-            if !row.is_expanded() {
+            if !row.is_expandable() || row.is_expanded() {
+                continue;
+            }
+            if let Some(id) = row
+                .item()
+                .and_then(|o| o.downcast::<PkiItemObject>().ok())
+                .map(|o| o.id())
+            {
                 out.insert(id);
             }
         }
@@ -168,10 +175,14 @@ impl Pages {
     /// Re-apply the collapsed set after a rebuild (new rows default to
     /// expanded because of TreeListModel autoexpand).
     pub fn restore_certs_collapsed(&self, collapsed: &std::collections::HashSet<i64>) {
-        for i in 0..self.certs_tree.n_items() {
-            let Ok(row) = self.certs_tree.item(i).unwrap().downcast::<gtk::TreeListRow>() else {
-                continue;
-            };
+        // Snapshot the rows first: set_expanded(false) removes the child
+        // rows from the model, so indices go stale mid-loop and item()
+        // would return None while n_items still counts the old length.
+        let targets: Vec<gtk::TreeListRow> = (0..self.certs_tree.n_items())
+            .filter_map(|i| self.certs_tree.item(i))
+            .filter_map(|o| o.downcast::<gtk::TreeListRow>().ok())
+            .collect();
+        for row in targets {
             let Some(id) = row
                 .item()
                 .and_then(|o| o.downcast::<PkiItemObject>().ok())
