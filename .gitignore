@@ -2,4 +2,6 @@
 /packaging/src
 /packaging/pkg
 *.pkg.tar.*
+*.tar.*
 *.deb
+/Сертификат/
