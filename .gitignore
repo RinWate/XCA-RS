@@ -3,6 +3,3 @@
 /packaging/pkg
 *.pkg.tar.*
 *.deb
-/packaging/aur/pkg/
-/packaging/aur/src/
-/packaging/aur/
