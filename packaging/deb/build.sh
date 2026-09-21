@@ -40,8 +40,11 @@ if command -v dpkg-deb >/dev/null; then
 else
     tmp="$(mktemp -d)"
     printf '2.0\n' > "$tmp/debian-binary"
-    tar -C "$stage" --owner=0 --group=0 --numeric-owner -czf "$tmp/control.tar.gz" DEBIAN
-    tar -C "$stage" --owner=0 --group=0 --numeric-owner -cJf "$tmp/data.tar.xz" usr
+    # The deb format requires control.tar members at the archive root
+    # (./control), not under ./DEBIAN/ — dpkg-deb does this remapping
+    # itself, the manual path must cd into DEBIAN and exclude it from data.
+    tar -C "$stage/DEBIAN" --owner=0 --group=0 --numeric-owner -czf "$tmp/control.tar.gz" .
+    tar -C "$stage" --owner=0 --group=0 --numeric-owner --exclude='./DEBIAN' -cJf "$tmp/data.tar.xz" .
     rm -f "$out"
     (cd "$tmp" && ar rcD "$out" debian-binary control.tar.gz data.tar.xz)
     rm -rf "$tmp"
