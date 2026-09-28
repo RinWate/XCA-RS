@@ -1,133 +1,143 @@
 # XCA RS
 
-A from-scratch rewrite of [XCA](https://github.com/chris2511/xca) (X Certificate
-and Key Management) in **Rust**, with a **GTK4 + libadwaita** interface — the
-same application concept as XCA (manage private keys, certificates, certificate
-signing requests, revocation), restated as a native GNOME app. Besides the
-classic RSA/EC/Ed25519 world it speaks **GOST**: CryptoPro-compatible keys,
-containers, signatures and PDF stamps.
+Переписанная с нуля на **Rust** версия [XCA](https://github.com/chris2511/xca)
+(X Certificate and Key Management) с интерфейсом на **GTK4 + libadwaita** —
+та же концепция приложения, что и у XCA (управление закрытыми ключами,
+сертификатами, запросами на подпись и списками отзыва), оформленная в виде
+нативного приложения GNOME. Помимо классического мира RSA/EC/Ed25519
+поддерживается **ГОСТ**: совместимые с КриптоПро ключи, контейнеры,
+подписи и штампы в PDF.
 
-## Features
+## Возможности
 
-- **Private keys**: generate RSA 2048/3072/4096, EC P-256/P-384/P-521, Ed25519
-  and GOST R 34.10-2012 (256/512-bit, through the OpenSSL gost engine —
-  install `openssl-gost-engine`); store, export (PKCS#8 PEM), delete.
-- **Certificates**: create self-signed CAs, issue certificates from a CA,
-  validity, serial, SKI/AKI, basic constraints, key usage, EKU presets
-  (server/client), subject alt names (typed XCA-style SAN editor: DNS / IP /
-  email / URI entries with add/remove), subject title (T, used by GOST
-  profiles); PEM (optionally with chain), DER and PKCS#12 / PFX export
-  (optionally with the issuing chain, password-protected). The list shows the
-  issuer CN and the signature algorithm; properties include the parsed
-  signature algorithm.
-- **Certificate requests (CSRs)**: create from subject + key, sign them with a
-  CA from the database; the list shows whether a request is already signed.
-- **Revocation**: revoke certificates (tracked per CA, `REVOKED` badge in the
-  list), generate CRLs (with AKI and CRL Number) for any CA that has its key
-  in the database, export CRLs as PEM.
-- **Import**: PEM and DER files with certificates, requests and private keys;
-  PKCS#12 bundles with password prompt; duplicate detection.
-- **CryptoPro compatibility**: closed key containers (the `*.000` folders
-  written by CryptoPro CSP — `header.key` / `masks.key` / `primary.key`, with
-  CPKDF password derivation and GOST 28147-89 decryption implemented natively,
-  no CryptoPro installation needed) and PFX files produced by CryptoPro CSP 5
-  (including its GOST keybag scheme and passwordless PFX) import directly;
-  the private key is linked to its certificate automatically.
-- **File signatures (CMS)**: sign any file detached (`.p7s`) or attached
-  (`.p7m`) with a certificate — and optionally its CA chain — from the
-  database; verification shows a full report with the signer chain. Works
-  with RSA, EC, Ed25519 and GOST certificates.
-- **PDF signing**: sign PDFs in place with a visible stamp — pick the spot by
-  clicking on a live page preview (rendered with poppler); the stamp shows the
-  signer CN, date and time, title, organization and the certificate
-  fingerprint (SHA-256). The signature is written as an incremental CMS
-  update: the original content and any earlier signatures stay intact, and
-  signing an already-signed document asks for confirmation. An invisible
-  signature is a toggle away. The verify dialog extracts every embedded PDF
-  signature, checks each revision against its certificate chain and warns
-  about modifications made after signing.
-- **PKCS#11 hardware tokens** (via the `cryptoki` crate): connect to a module,
-  list token keys, and create a CA whose private key never leaves the token
-  (TBS is signed on the token with CKM_SHA256_RSA_PKCS / pure EdDSA, the
-  final certificate DER is assembled locally and verified). RSA and Ed25519
-  token keys are supported for signing.
-- **Native XCA database format**: xca-rs reads and writes the same `.xdb`
-  SQLite database as the original XCA — open your existing XCA database
-  directly and keep using it in both programs. Private keys are stored
-  PKCS#8-encrypted (PBES2/AES) with the database password (`pwhash`
-  scheme); set or change the password via the menu, unlock prompt on
-  start. Databases of the earlier xca-rs-specific format (SQLCipher) are
-  migrated automatically on first open (the original is kept as
-  `*.old.bak`).
-- **Database selection**: the menu (☰ → *Database*) can open an existing
-  database or create a new one; the last used database is remembered in
-  `~/.config/xca-rs/config.ini` and reopened on start. The default is
-  `~/.local/share/xca-rs/xca-rs.db`; the `XCA_RS_DB` environment variable
-  overrides everything.
-- **Localization**: the UI is translatable; Russian is included. The language
-  is detected from `LANG`/`LC_ALL` (or forced with `XCA_RS_LANG=ru|en`).
+- **Закрытые ключи**: генерация RSA 2048/3072/4096, EC P-256/P-384/P-521,
+  Ed25519 и ГОСТ Р 34.10-2012 (256/512 бит; gost-движок OpenSSL встроен в
+  программу); хранение, экспорт (PKCS#8 PEM), удаление.
+- **Сертификаты**: создание самоподписанных CA, выпуск сертификатов
+  подписывающим CA, срок действия, серийный номер, SKI/AKI, basic
+  constraints, key usage, готовые наборы EKU (server/client), альтернативные
+  имена субъекта (типизированный XCA-подобный редактор SAN: записи DNS / IP /
+  email / URI с добавлением и удалением), должность в субъекте (T,
+  используется в ГОСТ-профилях); экспорт в PEM (при необходимости — с цепочкой),
+  DER и PKCS#12 / PFX (с цепочкой выпустивших CA по желанию, с защитой
+  паролем). В списке отображаются CN издателя и алгоритм подписи; в
+  свойствах — разобранный алгоритм подписи.
+- **Запросы на подпись (CSR)**: создание из субъекта и ключа, подпись
+  выпускающим CA из базы; в списке видно, подписан ли уже запрос.
+- **Отзыв**: отзыв сертификатов (учёт по каждому CA, значок `REVOKED` в
+  списке), генерация CRL (с AKI и CRL Number) для любого CA, чей ключ есть
+  в базе, экспорт CRL в PEM.
+- **Импорт**: PEM- и DER-файлы с сертификатами, запросами и закрытыми
+  ключами; PKCS#12-бандлы с запросом пароля; обнаружение дубликатов.
+- **Совместимость с КриптоПро**: закрытые ключевые контейнеры (каталоги
+  `*.000`, создаваемые КриптоПро CSP — `header.key` / `masks.key` /
+  `primary.key`; вывод ключа по паролю CPKDF и расшифрование ГОСТ
+  28147-89 реализованы нативно, установка КриптоПро не нужна) и PFX-файлы,
+  созданные КриптоПро CSP 5 (включая фирменную схему GOST-keybag и PFX без
+  пароля), импортируются напрямую; закрытый ключ автоматически привязывается
+  к своему сертификату.
+- **Подписи файлов (CMS)**: подписание любого файла отделённой (`.p7s`) или
+  присоединённой (`.p7m`) подписью сертификатом из базы — при желании вместе
+  с цепочкой CA; проверка показывает полный отчёт с цепочкой подписантов.
+  Работает с сертификатами RSA, EC, Ed25519 и ГОСТ.
+- **Подпись PDF**: подписание PDF на месте видимым штампом — место
+  выбирается кликом по живому предпросмотру страницы (рендер через poppler);
+  на штампе отображаются CN подписанта, дата и время, должность,
+  организация и отпечаток сертификата (SHA-256). Подпись записывается как
+  инкрементальное CMS-обновление: исходное содержимое и все предыдущие
+  подписи остаются нетронутыми, а подписание уже подписанного документа
+  требует подтверждения. Невидимая подпись — в один переключатель. Диалог
+  проверки извлекает каждую встроенную PDF-подпись, проверяет каждую
+  ревизию по цепочке сертификатов и предупреждает об изменениях, сделанных
+  после подписания.
+- **Аппаратные токены PKCS#11** (через крейт `cryptoki`): подключение к
+  модулю, список ключей на токене и создание CA, закрытый ключ которого
+  никогда не покидает токен (TBS подписывается на токене алгоритмами
+  CKM_SHA256_RSA_PKCS / чистым EdDSA, итоговый DER сертификата собирается
+  локально и проверяется). Для подписи поддерживаются ключи RSA и Ed25519
+  на токенах.
+- **Родной формат базы XCA**: xca-rs читает и пишет ту же SQLite-базу
+  `.xdb`, что и оригинальный XCA, — открывайте существующую базу XCA
+  напрямую и продолжайте работать с ней в обеих программах. Закрытые ключи
+  хранятся в PKCS#8-шифрованном виде (PBES2/AES) с паролем базы (схема
+  `pwhash`); пароль задаётся и меняется через меню, при старте — запрос на
+  разблокировку. Базы прежнего xca-rs-формата (SQLCipher) автоматически
+  мигрируются при первом открытии (оригинал сохраняется как `*.old.bak`).
+  Базы на сетевых каталогах (SMB/CIFS, NFS, sshfs) открываются в режиме без
+  файловых блокировок — обычное для SQLite ограничение на сетевых ФС.
+- **Выбор базы данных**: меню (☰ → *База данных*) открывает существующую
+  базу или создаёт новую; последняя использованная база запоминается в
+  `~/.config/xca-rs/config.ini` и открывается при старте. База по умолчанию —
+  `~/.local/share/xca-rs/xca-rs.db`; переменная окружения `XCA_RS_DB`
+  переопределяет всё.
+- **Локализация**: интерфейс переводится; русский язык включён. Язык
+  определяется по `LANG`/`LC_ALL` (или задаётся принудительно через
+  `XCA_RS_LANG=ru|en`).
 
-## Localization
+## Локализация
 
-Translations use [`rust-i18n`](https://crates.io/crates/rust-i18n): the files in
-`locales/*.toml` are embedded into the binary at compile time, and source code
-wraps user-visible strings in the `tr!()` macro (the English text doubles as
-the lookup key, so a missing translation simply falls back to English).
+Переводы используют [`rust-i18n`](https://crates.io/crates/rust-i18n): файлы
+из `locales/*.toml` встраиваются в бинарник при сборке, а строки в исходном
+коде оборачиваются в макрос `tr!()` (английский текст одновременно служит
+ключом поиска, поэтому отсутствующий перевод просто откатывается на
+английский).
 
-To add a language:
+Чтобы добавить язык:
 
-1. create `locales/<lang>.toml` (copy `ru.toml`, translate the values);
-2. rebuild — that's it; the locale is picked from `LANG` at startup.
+1. создайте `locales/<lang>.toml` (скопируйте `ru.toml`, переведите значения);
+2. пересоберите проект — всё; язык выбирается по `LANG` при старте.
 
-Interpolation uses `%{name}` placeholders, e.g.
+Интерполяция использует подстановки вида `%{name}`, например
 `tr!("Key “%{name}” created", name = label)`.
 
-## Status / scope
+## Статус / охват
 
-A functional core, not a 1:1 port of XCA's ~37k lines of C++. Not covered
-yet (see the original C++ code for reference):
+Работоспособное ядро, а не построчный порт ~37 тысяч строк C++ из XCA. Пока
+не реализовано (за образец берите исходники оригинала на C++):
 
-- PKCS#11: browsing slot/key pickers are minimal (first token), EC token-key
-  signing, moving/copying keys onto tokens, PIN change dialogs
-- CRL distribution points, per-entry revocation reasons
-- Certificate templates, database i18n; OpenSSL dumps and a few technical
-  field subtitles remain English
-- CSR extensions (the openssl crate cannot add them yet), NSPKI import
-- PDF: encrypted documents are refused; signing assumes the whole file fits
-  in memory
+- PKCS#11: выбор слота/ключа минимален (первый токен), подпись EC-ключом на
+  токене, перенос/копирование ключей на токен, диалоги смены PIN
+- точки распределения CRL, причины отзыва для отдельных записей
+- шаблоны сертификатов, перевод базы данных; OpenSSL-дампы и технические
+  подсказки к полям остаются на английском
+- расширения CSR (крейт openssl их пока добавлять не умеет), импорт NSPKI
+- PDF: зашифрованные документы отклоняются; подпись предполагает, что весь
+  файл помещается в памяти
 
-## Build and run
+## Сборка и запуск
 
-Dependencies (Arch names): `rust`, `gcc`, `pkgconf`, `gtk4`, `libadwaita`,
-`openssl`, `poppler` (poppler-glib, for the PDF page preview), plus a C
-compiler for the bundled SQLite/SQLCipher amalgamation. GOST needs no
-system packages: xca-rs embeds a copy of the gost engine
-(`packaging/gost/gost.so`) and unpacks it into `~/.cache/xca-rs` at
-runtime. A system gost provider or engine takes precedence when present.
+Зависимости (названия Arch): `rust`, `gcc`, `pkgconf`, `gtk4`,
+`libadwaita`, `openssl`, `poppler` (poppler-glib, для предпросмотра страниц
+PDF), плюс C-компилятор для встроенного амальгамного SQLite/SQLCipher.
+Для ГОСТ системные пакеты не нужны: xca-rs несёт в себе копию gost-движка
+(`packaging/gost/gost.so`) и распаковывает её в `~/.cache/xca-rs` во время
+работы. Системный gost-провайдер или движок, если установлен, имеет
+приоритет.
 
 ```sh
 cargo run --release
 ```
 
-Tests (crypto round-trips, CRL building, DER assembly, PKCS#12, XCA-format
-storage and interop, migration, GOST 28147-89 container/keybag decoding,
-PDF signing):
+Тесты (криптографические раундтрипы, сборка CRL, DER-ассемблирование,
+PKCS#12, хранение и совместимость формата XCA, миграция, декодирование
+контейнеров/keybag ГОСТ 28147-89, подпись PDF):
 
 ```sh
 cargo test
 ```
 
-## Packaging
+## Упаковка
 
-- **Arch Linux**: the [AUR](https://aur.archlinux.org) carries `xca-rs`
-  (builds from the release tarball) and `xca-rs-bin` (installs the prebuilt
-  binary from the GitHub release).
-- **Debian**: `packaging/deb/build.sh` → `xca-rs_…_amd64.deb` (uses
-  `dpkg-deb` when present, otherwise assembles the package with `ar`+`tar`).
+- **Arch Linux**: в [AUR](https://aur.archlinux.org) есть `xca-rs` (сборка из
+  релизного tarball) и `xca-rs-bin` (установка готового бинарника из релиза
+  на GitHub).
+- **Debian**: `packaging/deb/build.sh` → `xca-rs_…_amd64.deb` (использует
+  `dpkg-deb`, а при его отсутствии собирает пакет вручную через `ar`+`tar`).
 
-The Debian script builds from the local working copy; the About dialog
-credits Denis "RinWate" Egorov <rinwate@yandex.ru> (https://github.com/RinWate).
+Debian-скрипт собирает из локальной рабочей копии; в диалоге «О приложении»
+указан автор — Denis "RinWate" Egorov <rinwate@yandex.ru>
+(https://github.com/RinWate).
 
-## License
+## Лицензия
 
-GPL-2.0-or-later, like the original XCA.
+GPL-2.0-or-later, как и оригинальный XCA.
