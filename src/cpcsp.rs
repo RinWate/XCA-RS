@@ -305,11 +305,19 @@ fn gost94(data: &[u8]) -> Result<[u8; 32], String> {
     engine_digest(b"md_gost94", data)
 }
 
-/// Digest by name through the gost engine (also Streebog, for the PFX
-/// KDF variants). Name lookup first, the engine's digest table by OID as
-/// fallback.
+/// Digest by name through the loaded gost support (also Streebog, for
+/// the PFX KDF variants). A provider fetch first — the (embedded or
+/// system) gost provider registers nothing in the legacy name table —
+/// then the engine path: name lookup and the engine's digest table by
+/// OID. Resolved MDs are cached: the PFX KDF calls this thousands of
+/// times per import and fetched provider MDs are refcounted.
 fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
     unsafe extern "C" {
+        fn EVP_MD_fetch(
+            ctx: *mut openssl_sys::OSSL_LIB_CTX,
+            algorithm: *const std::ffi::c_char,
+            properties: *const std::ffi::c_char,
+        ) -> *mut openssl_sys::EVP_MD;
         fn EVP_get_digestbyname(name: *const std::ffi::c_char) -> *const openssl_sys::EVP_MD;
         fn ENGINE_get_digest(
             e: *const openssl_sys::ENGINE,
@@ -323,15 +331,47 @@ fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
             "GOST is not available: the gost engine is missing (install openssl-gost-engine)"
         ));
     }
-    unsafe {
-        let mut md = EVP_get_digestbyname(name.as_ptr());
-        if md.is_null() {
-            let nid = OBJ_txt2nid(c"1.2.643.2.2.9".as_ptr());
-            md = ENGINE_get_digest(
-                crypto::gost_engine_ptr() as *const openssl_sys::ENGINE,
-                nid,
-            );
+    // (EVP_MD, engine-for-EVP_DigestInit_ex): NULL engine for provider
+    // MDs, the gost engine for engine MDs. Stored as raw pointers are
+    // not Send — the cache keeps address-sized integers instead.
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u8>, (usize, usize)>>,
+    > = std::sync::OnceLock::new();
+
+    fn resolve_md(
+        name: &std::ffi::CStr,
+    ) -> (*const openssl_sys::EVP_MD, *mut openssl_sys::ENGINE) {
+        unsafe {
+            // Provider path (the embedded gost provider): fetched MD,
+            // EVP_DigestInit_ex must get a NULL engine for it.
+            let md = EVP_MD_fetch(std::ptr::null_mut(), name.as_ptr(), std::ptr::null());
+            if !md.is_null() {
+                return (md, std::ptr::null_mut());
+            }
+            let mut md = EVP_get_digestbyname(name.as_ptr());
+            if md.is_null() {
+                let nid = OBJ_txt2nid(c"1.2.643.2.2.9".as_ptr());
+                md = ENGINE_get_digest(
+                    crypto::gost_engine_ptr() as *const openssl_sys::ENGINE,
+                    nid,
+                );
+            }
+            (md, crypto::gost_engine_ptr() as *mut openssl_sys::ENGINE)
         }
+    }
+
+    let (md, engine): (*const openssl_sys::EVP_MD, *mut openssl_sys::ENGINE) = {
+        let lock = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut map = lock.lock().unwrap();
+        let (md, engine) = *map
+            .entry(name.as_bytes().to_vec())
+            .or_insert_with(|| {
+                let (md, engine) = resolve_md(&name);
+                (md as usize, engine as usize)
+            });
+        (md as *const _, engine as *mut _)
+    };
+    unsafe {
         if md.is_null() {
             return Err("digest is unavailable".to_string());
         }
@@ -339,11 +379,7 @@ fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
         if ctx.is_null() {
             return Err("EVP_MD_CTX_new failed".to_string());
         }
-        let mut ok = openssl_sys::EVP_DigestInit_ex(
-            ctx,
-            md,
-            crypto::gost_engine_ptr() as *mut openssl_sys::ENGINE,
-        ) == 1;
+        let mut ok = openssl_sys::EVP_DigestInit_ex(ctx, md, engine) == 1;
         let mut out = [0u8; 32];
         let mut len = 0u32;
         if ok {
@@ -788,6 +824,9 @@ mod pfx_manual {
             if gost {
                 // Without the engine the keybag cannot be decrypted at all.
                 assert!(g.key.is_some(), "{name}: key not decrypted with gost engine");
+            } else {
+                // …but the skip must be surfaced for the import warning.
+                assert!(g.key_bag_skipped, "{name}: skipped GOST keybag not reported");
             }
             checked += 1;
         }
@@ -843,6 +882,10 @@ fn tlvr(data: &[u8], pos: usize) -> Result<((u8, usize, usize), usize), String> 
 pub struct GostPfx {
     pub key: Option<PKey<Private>>,
     pub certs: Vec<X509>,
+    /// A vendor GOST shrouded keybag was present but its key could not
+    /// be decrypted (usually: no gost engine) — surfaced to the user
+    /// instead of silently importing the public part only.
+    pub key_bag_skipped: bool,
 }
 
 /// Walk a PFX by hand. The MAC is not checked — a wrong password simply
@@ -876,6 +919,7 @@ pub fn parse_gost_pfx(data: &[u8], password: &str) -> Result<GostPfx, String> {
     let mut out = GostPfx {
         key: None,
         certs: Vec::new(),
+        key_bag_skipped: false,
     };
     // AuthenticatedSafe ::= SEQ of ContentInfo
     let ((_, ci_s, ci_e), _) = tlvr(data, as_s)?;
@@ -1083,6 +1127,14 @@ fn decrypt_bag(
 
 
 
+/// eprintln for XCA_PFX_DEBUG=1 runs: traces where a GOST keybag
+/// decrypt bails out.
+fn kbdbg(msg: impl std::fmt::Display) {
+    if std::env::var("XCA_PFX_DEBUG").is_ok() {
+        eprintln!("keybag: {msg}");
+    }
+}
+
 /// The vendor CryptoPro keybag PBE (`1.2.840.113549.1.12.1.80`),
 /// ported from the upstream gost-engine `gost_cryptopro_keybag.c`:
 ///
@@ -1101,6 +1153,7 @@ fn open_gost_keybag(
     password: &str,
 ) -> Option<PKey<Private>> {
     if salt.len() < 8 || !(1..=1_000_000).contains(&iterations) {
+        kbdbg(format!("bad params: salt {} bytes, {iterations} iterations", salt.len()));
         return None;
     }
     // (1) iterated KDF — UTF-16LE password, empty password stays empty.
@@ -1114,7 +1167,13 @@ fn open_gost_keybag(
         let mut input = cur.clone();
         input.extend_from_slice(salt);
         input.extend_from_slice(&((c as u16).to_be_bytes()));
-        cur = engine_digest(b"md_gost94", &input).ok()?.to_vec();
+        match engine_digest(b"md_gost94", &input) {
+            Ok(d) => cur = d.to_vec(),
+            Err(e) => {
+                kbdbg(format!("md_gost94 KDF failed: {e}"));
+                return None;
+            }
+        }
     }
     let Ok(k) = <[u8; 32]>::try_from(cur.as_slice()) else {
         return None;
@@ -1162,12 +1221,19 @@ fn open_gost_keybag(
     }
     let value = value?;
     if value.len() < 16 || value.len() < 16 + 8 {
+        kbdbg(format!("CPBlob value too short: {} bytes", value.len()));
         return None;
     }
     let (is_512, raw_len) = match (&value[4], &value[5]) {
         (0x46, 0xAA) => (false, 32usize),
         (0x42, 0xAA) => (true, 64),
-        _ => return None,
+        _ => {
+            kbdbg(format!(
+                "unknown CPBlob magic {:02X}{:02X}",
+                value[4], value[5]
+            ));
+            return None;
+        }
     };
     let _ = is_512;
 
@@ -1221,6 +1287,7 @@ fn open_gost_keybag(
     let curve = curve?;
     let digest = digest?;
     if cek_enc.len() != raw_len {
+        kbdbg(format!("cek.enc is {} bytes, expected {raw_len}", cek_enc.len()));
         return None;
     }
 
@@ -1230,7 +1297,13 @@ fn open_gost_keybag(
     mac_input.push(0x00);
     mac_input.extend_from_slice(&ukm);
     mac_input.extend_from_slice(&[0x01, 0x00]);
-    let ke = hmac_engine(64, b"md_gost12_256", &k, &mac_input).ok()?;
+    let ke = match hmac_engine(64, b"md_gost12_256", &k, &mac_input) {
+        Ok(v) => v,
+        Err(e) => {
+            kbdbg(format!("HMAC-Streebog failed: {e}"));
+            return None;
+        }
+    };
 
     // (6) raw scalar = gost89-ECB-decrypt(Ke, cek.enc) — little-endian
     // wire format, consumed as-is.
@@ -1247,8 +1320,14 @@ fn open_gost_keybag(
     let curve_oid = oid_text(&curve);
     let digest_oid = oid_text(&digest);
     let der = build_pkcs8(alg_oid, &digest_oid, &curve_oid, &raw);
-    
-    crypto::load_private_key(&pem_encode(&der)).ok()
+
+    match crypto::load_private_key(&pem_encode(&der)) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            kbdbg(format!("final PKCS#8 load failed: {e}"));
+            None
+        }
+    }
 }
 
 
@@ -1500,6 +1579,8 @@ fn handle_safe_bag(
             // the wild; PKCS#8 validity is the oracle.
             if let Some(k) = open_gost_keybag(&salt, iterations, &cipher, password) {
                 out.key = Some(k);
+            } else {
+                out.key_bag_skipped = true;
             }
         } else if let Ok(p8) = decrypt_bag(&value[..p5], &oid, &salt, iterations, cipher, password)
             && let Some(k) = try_pkcs8_to_pkey(&p8) {

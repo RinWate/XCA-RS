@@ -100,8 +100,10 @@ yet (see the original C++ code for reference):
 
 Dependencies (Arch names): `rust`, `gcc`, `pkgconf`, `gtk4`, `libadwaita`,
 `openssl`, `poppler` (poppler-glib, for the PDF page preview), plus a C
-compiler for the bundled SQLite/SQLCipher amalgamation. `openssl-gost-engine`
-is optional and only needed for GOST keys and signatures.
+compiler for the bundled SQLite/SQLCipher amalgamation. GOST needs no
+system packages: xca-rs embeds a copy of the gost engine
+(`packaging/gost/gost.so`) and unpacks it into `~/.cache/xca-rs` at
+runtime. A system gost provider or engine takes precedence when present.
 
 ```sh
 cargo run --release

@@ -40,15 +40,8 @@ mod gost_ffi {
             appname: *const c_char,
             flags: std::ffi::c_ulong,
         ) -> c_int;
-        pub fn ENGINE_ctrl_cmd_string(
-            e: *mut ENGINE,
-            cmd_name: *const c_char,
-            arg: *const c_char,
-            cmd_optional: c_int,
-        ) -> c_int;
         pub fn ENGINE_init(e: *mut ENGINE) -> c_int;
         pub fn ENGINE_set_default_string(e: *mut ENGINE, def_list: *const c_char) -> c_int;
-        pub fn ENGINE_free(e: *mut ENGINE) -> c_int;
         pub fn OBJ_txt2nid(s: *const c_char) -> c_int;
         pub fn BIO_free(b: *mut openssl_sys::BIO) -> c_int;
         pub fn EVP_PKEY_CTX_ctrl_str(
@@ -93,10 +86,64 @@ pub fn init_legacy_provider() -> bool {
     })
 }
 
+/// The gost ENGINE module (see `packaging/gost/README.md` for its exact
+/// source commit), embedded so GOST works on machines with no system
+/// gost engine or provider installed at all. The engine — not the
+/// provider build — because X509/CMS verification resolves digest
+/// algorithms through the legacy name/sigid tables, which only the
+/// engine registers (pure-provider gost still fails verify with
+/// "unknown message digest algorithm" on OpenSSL 3.5).
+static GOST_ENGINE_SO: &[u8] = include_bytes!("../packaging/gost/gost.so");
+
+/// Unpack the embedded gost engine into the user cache directory and
+/// load it through OPENSSL_ENGINES + ENGINE_by_id (the native lookup the
+/// openssl CLI uses). False when nothing worked; the caller falls
+/// through to its other options.
+fn load_embedded_gost_engine(name: &std::ffi::CString) -> bool {
+    use std::path::PathBuf;
+    let dir: PathBuf = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .map(|d| d.join("xca-rs"))
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("gost.so");
+    let fresh = std::fs::read(&path).is_ok_and(|cur| cur == GOST_ENGINE_SO);
+    if !fresh {
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        // Write-then-rename: atomic, and a concurrently running instance
+        // keeps using its old inode.
+        let tmp = dir.join(".gost.so.tmp");
+        if std::fs::write(&tmp, GOST_ENGINE_SO).is_err() || std::fs::rename(&tmp, &path).is_err() {
+            return false;
+        }
+    }
+    let Some(dir) = path.parent() else { return false };
+    // SAFETY: startup path, single-threaded in practice (see the comment
+    // in load_gost_engine).
+    unsafe { std::env::set_var("OPENSSL_ENGINES", dir) };
+    unsafe {
+        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        if e.is_null() {
+            return false;
+        }
+        // Keep the engine initialized and default forever; never free.
+        let ok = gost_ffi::ENGINE_init(e) == 1
+            && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
+        if ok {
+            let _ = GOST_ENGINE_PTR.set(e as usize);
+            let _ = GOST_NIDS.set(resolve_gost_nids());
+        }
+        ok
+    }
+}
+
 /// Load GOST support: a "gost" provider when one exists, otherwise the
-/// gost ENGINE from the engine directory (or `XCA_GOST_ENGINE`). The
-/// engine is made the default for everything — after that GOST keys,
-/// digests and signatures work through the normal OpenSSL APIs. Idempotent.
+/// gost ENGINE — system-installed first (engine directory or
+/// `XCA_GOST_ENGINE`), then the embedded copy. Idempotent.
 pub fn init_gost() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| unsafe {
@@ -105,20 +152,22 @@ pub fn init_gost() -> bool {
         // Future-proof: a real provider beats the engine path.
         let prov = openssl_sys::OSSL_PROVIDER_try_load(std::ptr::null_mut(), name.as_ptr(), 1);
         if !prov.is_null() {
+            let _ = GOST_NIDS.set(resolve_gost_nids());
             return true; // keep it loaded for the process lifetime
         }
         let e = load_gost_engine(&name);
-        if e.is_null() {
-            return false;
+        if !e.is_null() {
+            // Keep the engine initialized and default forever; never finish/free.
+            let ok = gost_ffi::ENGINE_init(e) == 1
+                && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
+            if ok {
+                let _ = GOST_ENGINE_PTR.set(e as usize);
+                let _ = GOST_NIDS.set(resolve_gost_nids());
+            }
+            return ok;
         }
-        // Keep the engine initialized and default forever; never finish/free.
-        let ok = gost_ffi::ENGINE_init(e) == 1
-            && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
-        if ok {
-            let _ = GOST_ENGINE_PTR.set(e as usize);
-            let _ = GOST_NIDS.set(resolve_gost_nids());
-        }
-        ok
+        // Neither a system provider nor a system engine: the embedded one.
+        load_embedded_gost_engine(&name)
     })
 }
 
@@ -156,7 +205,12 @@ fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
             return e;
         }
     }
-    // Load the dynamic engine from known locations.
+    // Load the engine from known locations. The classic "dynamic"
+    // SO_PATH/ID/LOAD dance stopped working on OpenSSL 3.5 (the module
+    // loads but never registers for ENGINE_by_id, and the half-loaded
+    // state segfaults at process exit) — point OPENSSL_ENGINES at the
+    // directory instead, which uses the native lookup the openssl CLI
+    // itself uses.
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("XCA_GOST_ENGINE") {
         paths.push(p.into());
@@ -167,20 +221,13 @@ fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
         paths.push(std::path::PathBuf::from(home).join(".local/lib/xca-rs/gost.so"));
     }
     for p in paths {
-        let Ok(path) = p.into_os_string().into_string() else { continue };
-        let Ok(path) = CString::new(path) else { continue };
-        let dyn_e = gost_ffi::ENGINE_by_id(c"dynamic".as_ptr());
-        if dyn_e.is_null() {
-            return std::ptr::null_mut();
-        }
-        let ok = gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"SO_PATH".as_ptr(), path.as_ptr(), 0) > 0
-            && gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"ID".as_ptr(), name.as_ptr(), 0) > 0
-            && gost_ffi::ENGINE_ctrl_cmd_string(dyn_e, c"LOAD".as_ptr(), std::ptr::null(), 0) > 0;
-        gost_ffi::ENGINE_free(dyn_e);
-        if ok
-            && let e = gost_ffi::ENGINE_by_id(name.as_ptr())
-            && !e.is_null()
-        {
+        let Some(dir) = p.parent() else { continue };
+        // Single-threaded in practice (main calls init_gost before GTK
+        // spawns anything); later calls are guarded by the OnceLock in
+        // init_gost and never reach here again.
+        std::env::set_var("OPENSSL_ENGINES", dir);
+        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        if !e.is_null() {
             return e;
         }
     }
@@ -1666,6 +1713,10 @@ pub enum Imported {
         key: Option<PKey<Private>>,
         cert: Option<X509>,
         ca: Vec<X509>,
+        /// A CryptoPro GOST keybag was in the file but its private key
+        /// could not be decrypted (gost engine missing) — warn the user
+        /// instead of a silent public-only import.
+        gost_key_skipped: bool,
     },
 }
 
@@ -1736,6 +1787,7 @@ pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Import
                         .ca
                         .map(|s| s.iter().map(|c| c.to_owned()).collect())
                         .unwrap_or_default(),
+                    gost_key_skipped: false,
                 }),
                 Err(e) => {
                     // CryptoPro CSP packs the keybag under its vendor GOST
@@ -1743,11 +1795,13 @@ pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Import
                     // hand-rolled walker.
                     let g = crate::cpcsp::parse_gost_pfx(data, password.unwrap_or(""))
                         .map_err(|_| format!("PKCS#12 parse error: {e} (wrong password?)"))?;
+                    let gost_key_skipped = g.key_bag_skipped && g.key.is_none();
                     let mut certs = g.certs.into_iter();
                     out.push(Imported::Pkcs12 {
                         key: g.key,
                         cert: certs.next(),
                         ca: certs.collect(),
+                        gost_key_skipped,
                     });
                 }
             }

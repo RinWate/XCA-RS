@@ -235,7 +235,13 @@ pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {
                     n_reqs += 1;
                 }
             }
-            Imported::Pkcs12 { key, cert, ca } => {
+            Imported::Pkcs12 { key, cert, ca, gost_key_skipped } => {
+                if gost_key_skipped && key.is_none() {
+                    error_dialog(
+                        &app.window,
+                        &tr!("The file contains a CryptoPro GOST private key, but the gost engine is not loaded, so only the certificate was imported. Install the gost engine (e.g. gost.so in ~/.local/lib/xca-rs) and import the file again to get the private key."),
+                    );
+                }
                 let mut key_id = None;
                 if let Some(key) = key {
                     let (k, bits, _) = crypto::key_info(key.as_ref());

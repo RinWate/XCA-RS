@@ -360,3 +360,6 @@
 "The name cannot be empty" = "The name cannot be empty"
 "Period" = "Period"
 "from %{from} to %{to}" = "from %{from} to %{to}"
+
+# ---- GOST keybag import warning ----
+"The file contains a CryptoPro GOST private key, but the gost engine is not loaded, so only the certificate was imported. Install the gost engine (e.g. gost.so in ~/.local/lib/xca-rs) and import the file again to get the private key." = "The file contains a CryptoPro GOST private key, but the gost engine is not loaded, so only the certificate was imported. Install the gost engine (e.g. gost.so in ~/.local/lib/xca-rs) and import the file again to get the private key."
