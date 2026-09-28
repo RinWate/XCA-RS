@@ -3,7 +3,7 @@
 //! embedded PDF signatures with a visible stamp — and verify them back.
 
 use super::pdf_place::{self, Placement, STAMP_W};
-use super::{action_row, combo, combo_ids, error_dialog, form_dialog, switch};
+use super::{action_row, combo, error_dialog, form_dialog, switch};
 use crate::app::App;
 use crate::crypto::{self, SignatureKind};
 use crate::pdf_sign::{self, StampOpts};
@@ -66,15 +66,23 @@ fn is_pdf_path(p: &std::path::Path) -> bool {
 }
 
 pub fn open_sign(app: &App) {
-    let certs: Vec<(i64, String, String)> = app
-        .db
-        .lock()
-        .unwrap()
-        .list_certs()
-        .unwrap_or_default()
-        .into_iter()
+    let certs = app.db.lock().unwrap().list_certs().unwrap_or_default();
+    let certs: Vec<(i64, String)> = certs
+        .iter()
         .filter(|c| c.key_id.is_some())
-        .map(|c| (c.id, c.name, c.subject))
+        .map(|c| {
+            // Only the internal name and the Organization field: full
+            // subject DNs made the dropdown unreadable.
+            let o = crypto::load_cert(&c.pem)
+                .ok()
+                .and_then(|x| crypto::name_o(x.subject_name()))
+                .filter(|o| !o.is_empty());
+            let label = match o {
+                Some(o) => format!("{} — {}", c.name, o),
+                None => c.name.clone(),
+            };
+            (c.id, label)
+        })
         .collect();
     if certs.is_empty() {
         return error_dialog(
@@ -82,9 +90,11 @@ pub fn open_sign(app: &App) {
             &tr!("Signing requires a certificate with its private key in the database."),
         );
     }
+    let labels: Vec<&str> = certs.iter().map(|(_, l)| l.as_str()).collect();
+    let cert_ids: Vec<Option<i64>> = certs.iter().map(|(id, _)| Some(*id)).collect();
 
     let form = form_dialog(&tr!("Sign File"), 560);
-    let (cert_row, cert_ids) = combo_ids(&tr!("Certificate"), &[], &certs, 0);
+    let cert_row = combo(&tr!("Certificate"), &labels, 0);
     let g = form.group(&tr!("Signer"));
     g.add(&cert_row);
 

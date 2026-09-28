@@ -79,6 +79,20 @@ unsafe fn resolve_gost_nids() -> (i32, i32, i32, i32) {
     )
 }
 
+/// Load OpenSSL's legacy provider: without it ciphers moved out of the
+/// default provider (RC2-40 above all) are not fetchable, and PKCS#12
+/// certbags that CryptoPro CSP exports with `pbeWithSHA1And40BitRC2`
+/// fail to decrypt with "unsupported algorithm". Idempotent; silently
+/// no-ops when the `legacy` module is not installed.
+pub fn init_legacy_provider() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| unsafe {
+        let name = c"legacy";
+        !openssl_sys::OSSL_PROVIDER_try_load(std::ptr::null_mut(), name.as_ptr(), 1).is_null()
+        // keep it loaded for the process lifetime (retain = 1)
+    })
+}
+
 /// Load GOST support: a "gost" provider when one exists, otherwise the
 /// gost ENGINE from the engine directory (or `XCA_GOST_ENGINE`). The
 /// engine is made the default for everything — after that GOST keys,
@@ -581,6 +595,12 @@ pub fn name_cn(name: &X509NameRef) -> Option<String> {
     subject_field(name, Nid::COMMONNAME)
 }
 
+/// Organization (O) entry of an X.509 name, if present — the signer
+/// dropdown shows it next to the internal name instead of the full DN.
+pub fn name_o(name: &X509NameRef) -> Option<String> {
+    subject_field(name, Nid::ORGANIZATIONNAME)
+}
+
 /// Lowercase SHA-256 hex of the certificate DER — the fingerprint shown
 /// on the PDF signature stamp.
 pub fn cert_fingerprint_hex(cert: &X509Ref) -> Option<String> {
@@ -694,6 +714,23 @@ fn validity_days_at(today: i64, count: u32, unit: ValidityUnit) -> u32 {
         }
     };
     (target - today).max(1) as u32
+}
+
+/// The not-before/not-after dates a certificate created right now with
+/// `count` × `unit` would carry, formatted DD.MM.YYYY — the live preview
+/// in the New Certificate dialog. `not_before` is today, `not_after` is
+/// `validity_days` later (the exact dates of the built certificate).
+pub fn validity_period(count: u32, unit: ValidityUnit) -> (String, String) {
+    validity_period_at(crate::xca_format::today_days(), count, unit)
+}
+
+fn validity_period_at(today: i64, count: u32, unit: ValidityUnit) -> (String, String) {
+    let fmt = |days: i64| {
+        let (y, m, d) = crate::xca_format::civil_from_days(days);
+        format!("{d:02}.{m:02}.{y:04}")
+    };
+    let end = today + validity_days_at(today, count, unit) as i64;
+    (fmt(today), fmt(end))
 }
 
 /// Parameters for `build_certificate`.
@@ -2323,6 +2360,23 @@ mod tests {
             let (y, m, d) = xf::civil_from_days(z);
             assert_eq!(xf::days_from_civil(y, m, d), z);
         }
+    }
+
+    #[test]
+    fn validity_period_dates() {
+        use crate::xca_format as xf;
+        // The dates the dialog preview promises are the certificate's
+        // not-before/not-after: today and today + validity_days.
+        let today = xf::days_from_civil(2026, 9, 28);
+        let (from, to) = validity_period_at(today, 1, ValidityUnit::Years);
+        assert_eq!(from, "28.09.2026");
+        assert_eq!(to, "28.09.2027");
+        // Jan 31 + 1 month lands on the last day of February (non-leap).
+        let (_, to) = validity_period_at(xf::days_from_civil(2027, 1, 31), 1, ValidityUnit::Months);
+        assert_eq!(to, "28.02.2027");
+        let (from, to) = validity_period_at(today, 30, ValidityUnit::Days);
+        assert_eq!(from, "28.09.2026");
+        assert_eq!(to, "28.10.2026");
     }
 
     #[test]

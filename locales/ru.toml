@@ -350,3 +350,13 @@
 "CryptoPro Container" = "Контейнер КриптоПро"
 "Private key imported" = "Закрытый ключ импортирован"
 "Private key imported and linked to its certificate" = "Закрытый ключ импортирован и привязан к сертификату"
+
+# ---- переименование, выбор подписанта, превью срока ----
+"Rename…" = "Переименовать…"
+"Rename Key" = "Переименование ключа"
+"Rename Certificate" = "Переименование сертификата"
+"Rename" = "Переименовать"
+"Renamed" = "Переименовано"
+"The name cannot be empty" = "Имя не может быть пустым"
+"Period" = "Период"
+"from %{from} to %{to}" = "с %{from} по %{to}"

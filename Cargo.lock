@@ -2009,13 +2009,14 @@ dependencies = [
 
 [[package]]
 name = "xca-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cryptoki",
  "flate2",
  "foreign-types",
  "gtk4",
  "libadwaita",
+ "libc",
  "lopdf",
  "openssl",
  "openssl-sys",

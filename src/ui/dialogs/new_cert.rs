@@ -16,6 +16,16 @@ use openssl::pkey::{PKey, Private, Public};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Live subtitle for the validity preview row: the exact not-before /
+/// not-after dates the certificate will get with the current settings.
+fn update_validity_preview(validity: &adw::SpinRow, unit_row: &adw::ComboRow, row: &adw::ActionRow) {
+    let (from, to) = crypto::validity_period(
+        validity.value() as u32,
+        crypto::ValidityUnit::from_combo(unit_row.selected()),
+    );
+    row.set_subtitle(&tr!("from %{from} to %{to}", from = from, to = to));
+}
+
 pub fn open(app: &App, from_req: Option<ReqRecord>) {
     let req_info = match &from_req {
         Some(r) => match crypto::load_req(&r.pem) {
@@ -131,6 +141,26 @@ pub fn open(app: &App, from_req: Option<ReqRecord>) {
     let g_val = form.group(&tr!("Validity"));
     g_val.add(&validity);
     g_val.add(&unit_row);
+    // Preview of the resulting validity period, updated live.
+    let preview_row = action_row(&tr!("Period"), "");
+    {
+        let v = validity.clone();
+        let u = unit_row.clone();
+        let p = preview_row.clone();
+        validity.connect_notify_local(Some("value"), move |_, _| {
+            update_validity_preview(&v, &u, &p);
+        });
+    }
+    {
+        let v = validity.clone();
+        let u = unit_row.clone();
+        let p = preview_row.clone();
+        unit_row.connect_notify_local(Some("selected"), move |_, _| {
+            update_validity_preview(&v, &u, &p);
+        });
+    }
+    update_validity_preview(&validity, &unit_row, &preview_row);
+    g_val.add(&preview_row);
 
     let ca_sw = switch(
         &tr!("Certificate Authority (CA)"),

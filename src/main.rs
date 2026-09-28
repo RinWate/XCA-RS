@@ -92,6 +92,9 @@ fn main() {
     // GOST keys/certificates need the gost engine loaded before anything
     // parses or generates crypto objects; silently no-ops without it.
     let _ = crypto::init_gost();
+    // RC2-encrypted PKCS#12 certbags (CryptoPro CSP exports) need the
+    // legacy provider; silently no-ops when the module is absent.
+    let _ = crypto::init_legacy_provider();
     rust_i18n::set_locale(detect_locale());
     let app = adw::Application::builder()
         .application_id(APP_ID)

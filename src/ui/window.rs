@@ -101,6 +101,9 @@ fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate
                 ));
             }
             acts.push((tr!("Export…"), false, Box::new(|a: &App| a.export_selected())));
+            if page == "keys" || page == "certs" {
+                acts.push((tr!("Rename…"), false, Box::new(|a: &App| a.rename_selected())));
+            }
             if page == "certs" {
                 acts.push((tr!("Revoke…"), false, Box::new(|a: &App| a.revoke_selected())));
             }
@@ -442,6 +445,9 @@ pub fn build(
     });
     bar_button(&tr!("Import…"), &["flat"], &app, &keys_bar, |a| a.import_dialog());
     bar_button(&tr!("Export…"), &["flat"], &app, &keys_bar, |a| a.export_selected());
+    bar_button(&tr!("Rename…"), &["flat"], &app, &keys_bar, |a| {
+        a.rename_selected()
+    });
     bar_button(&tr!("Properties"), &["flat"], &app, &keys_bar, |a| {
         a.details_selected()
     });
@@ -458,6 +464,9 @@ pub fn build(
     );
     bar_button(&tr!("Import…"), &["flat"], &app, &certs_bar, |a| a.import_dialog());
     bar_button(&tr!("Export…"), &["flat"], &app, &certs_bar, |a| a.export_selected());
+    bar_button(&tr!("Rename…"), &["flat"], &app, &certs_bar, |a| {
+        a.rename_selected()
+    });
     bar_button(&tr!("Revoke…"), &["flat"], &app, &certs_bar, |a| a.revoke_selected());
     bar_button(&tr!("Properties"), &["flat"], &app, &certs_bar, |a| {
         a.details_selected()

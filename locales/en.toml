@@ -350,3 +350,13 @@
 "CryptoPro Container" = "CryptoPro Container"
 "Private key imported" = "Private key imported"
 "Private key imported and linked to its certificate" = "Private key imported and linked to its certificate"
+
+# ---- renaming, signer dropdown, validity preview ----
+"Rename…" = "Rename…"
+"Rename Key" = "Rename Key"
+"Rename Certificate" = "Rename Certificate"
+"Rename" = "Rename"
+"Renamed" = "Renamed"
+"The name cannot be empty" = "The name cannot be empty"
+"Period" = "Period"
+"from %{from} to %{to}" = "from %{from} to %{to}"

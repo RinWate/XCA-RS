@@ -201,6 +201,21 @@ pub fn open_crl(app: &App, rec: &crate::db::CrlRecord) {
 
     // One row per revoked certificate: serial as the title, revocation
     // date and reason (CRL entry extension) as the subtitle.
+    // Serials are matched against the database so the row can show the
+    // certificate's internal name — far more readable than bare hex.
+    let norm_serial = |s: &str| {
+        let t = s.trim_start_matches('0');
+        if t.is_empty() { "0".to_string() } else { t.to_lowercase() }
+    };
+    let certs_by_serial: std::collections::HashMap<String, String> = app
+        .db
+        .lock()
+        .unwrap()
+        .list_certs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| (norm_serial(&c.serial), c.name))
+        .collect();
     let g2 = form.group(&tr!("Revoked Certificates"));
     let mut any = false;
     if let Some(stack) = crl.get_revoked() {
@@ -218,11 +233,15 @@ pub fn open_crl(app: &App, rec: &crate::db::CrlRecord) {
                 .flatten()
                 .and_then(|(_, e)| e.get_i64().ok())
                 .map(crate::xca_format::reason_name);
-            let subtitle = match reason {
-                Some(r) => format!("{} · {}", rev.revocation_date(), r),
-                None => rev.revocation_date().to_string(),
-            };
-            g2.add(&action_row(&format!("0x{serial}"), &subtitle));
+            let mut subtitle_parts = vec![format!("0x{serial}"), rev.revocation_date().to_string()];
+            if let Some(r) = reason {
+                subtitle_parts.push(r.to_string());
+            }
+            let title = certs_by_serial
+                .get(&norm_serial(&serial))
+                .cloned()
+                .unwrap_or_else(|| format!("0x{serial}"));
+            g2.add(&action_row(&title, &subtitle_parts.join(" · ")));
             any = true;
         }
     }

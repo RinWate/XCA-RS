@@ -8,8 +8,8 @@
 # then refresh .SRCINFO (makepkg --printsrcinfo).
 
 pkgname=xca-rs-bin
-pkgver=0.3.0
-pkgrel=2
+pkgver=0.4.0
+pkgrel=1
 pkgdesc="XCA rewritten in Rust with GTK4 and GOST support — prebuilt binary"
 arch=('x86_64')
 url="https://github.com/RinWate/xca-rs"

@@ -747,6 +747,52 @@ mod pfx_manual {
         let _ = cert2;
         eprintln!("GOST PFX round trip OK ({} bytes)", der.len());
     }
+
+    /// Real CryptoPro CSP exports (the kind users hit in the wild):
+    /// RC2-40-encrypted certbags + the vendor GOST keybag. The certbags
+    /// need the OpenSSL legacy provider; the keybag needs the gost
+    /// engine, so it is only asserted when one is available.
+    /// Run with `cargo test -- --ignored cryptopro_pfx --nocapture`.
+    #[test]
+    #[ignore]
+    fn cryptopro_pfx() {
+        assert!(crate::crypto::init_legacy_provider(), "legacy provider required");
+        let gost = crate::crypto::init_gost();
+        let dir = std::path::PathBuf::from(
+            std::env::var("XCA_TEST_CRYPTOPRO_DIR")
+                .unwrap_or_else(|_| "~/Сертификаты".into())
+                .replace('~', &std::env::var("HOME").unwrap_or_default()),
+        );
+        let mut checked = 0;
+        for name in ["Администрация.pfx", "ВДУ.pfx"] {
+            let path = dir.join(name);
+            let Ok(data) = std::fs::read(&path) else {
+                eprintln!("skipping: {} not found", path.display());
+                continue;
+            };
+            let g = super::parse_gost_pfx(&data, "")
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!g.certs.is_empty(), "{name}: no certificates extracted");
+            let subj = g.certs[0]
+                .subject_name()
+                .entries()
+                .next()
+                .and_then(|e| e.data().to_string().ok())
+                .unwrap_or_default();
+            eprintln!(
+                "{name}: {} cert(s), key: {} (subject starts {:?})",
+                g.certs.len(),
+                if g.key.is_some() { "yes" } else { "no" },
+                subj
+            );
+            if gost {
+                // Without the engine the keybag cannot be decrypted at all.
+                assert!(g.key.is_some(), "{name}: key not decrypted with gost engine");
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no test files in {}", dir.display());
+    }
 }
 
 /// DER OID content bytes → dotted text.
@@ -843,10 +889,18 @@ pub fn parse_gost_pfx(data: &[u8], password: &str) -> Result<GostPfx, String> {
 }
 
 /// One ContentInfo of the AuthenticatedSafe: pkcs7-data whose payload is
-/// either plain SafeContents or a `SEQ { algorithm, ciphertext }` pair.
+/// either plain SafeContents or a `SEQ { algorithm, ciphertext }` pair,
+/// or a pkcs7-encryptedData wrapper (how CryptoPro CSP packs the
+/// certificate bags).
 fn handle_content_info(payload: &[u8], password: &str, out: &mut GostPfx) -> Result<(), String> {
     let ((t, os, oe), p2) = tlvr(payload, 0)?;
-    if t != 0x06 || oid_text(&payload[os..oe]) != "1.2.840.113549.1.7.1" {
+    if t != 0x06 {
+        return Ok(());
+    }
+    if oid_text(&payload[os..oe]) == "1.2.840.113549.1.7.6" {
+        return handle_encrypted_data(payload, p2, password, out);
+    }
+    if oid_text(&payload[os..oe]) != "1.2.840.113549.1.7.1" {
         return Ok(());
     }
     let (t2, a_s, _) = tlvr(payload, p2)?.0;
@@ -885,6 +939,60 @@ fn handle_content_info(payload: &[u8], password: &str, out: &mut GostPfx) -> Res
             format!("CI oid={oid} plain head {:02X?}", &plain[..plain.len().min(12)]),
         );
     }
+    if looks_like_safe_contents(&plain) {
+        walk_safe_contents(&plain, password, out)?;
+    }
+    Ok(())
+}
+
+/// A pkcs7-encryptedData ContentInfo — the wrapper CryptoPro CSP puts
+/// around the certificate bags instead of encrypting the whole authSafe:
+/// `[0] { EncryptedData { version, EncryptedContentInfo { pkcs7-data,
+/// PBE algorithm, [0] IMPLICIT ciphertext } } }`. The decrypted payload
+/// is a plain SafeContents. Standard PKCS#12 PBEs (SHA1/RC2/3DES) go
+/// through OpenSSL; the vendor GOST PBE through the hand-written path.
+fn handle_encrypted_data(payload: &[u8], p2: usize, password: &str, out: &mut GostPfx) -> Result<(), String> {
+    // [0] { EncryptedData SEQUENCE }
+    let (t2, a_s, _) = tlvr(payload, p2)?.0;
+    if t2 != 0xA0 {
+        return Ok(());
+    }
+    let (t3, ed_s, _) = tlvr(payload, a_s)?.0;
+    if t3 != 0x30 {
+        return Ok(());
+    }
+    // EncryptedData ::= SEQ { version INTEGER, EncryptedContentInfo SEQ }
+    let ((_, _ver, _), p3) = tlvr(payload, ed_s)?;
+    let (t4, eci_s, _) = tlvr(payload, p3)?.0;
+    if t4 != 0x30 {
+        return Ok(());
+    }
+    // EncryptedContentInfo ::= SEQ { contentType OID, alg SEQ, [0] cipher }
+    let ((t5, ct_s, ct_e), p6) = tlvr(payload, eci_s)?;
+    if t5 != 0x06 || oid_text(&payload[ct_s..ct_e]) != "1.2.840.113549.1.7.1" {
+        return Ok(());
+    }
+    let ((t6, alg_s, alg_e), p7) = tlvr(payload, p6)?;
+    if t6 != 0x30 {
+        return Ok(());
+    }
+    let (oid, salt, iterations) = parse_pbe_alg(&payload[alg_s..alg_e]);
+    // The ciphertext is [0] IMPLICIT primitive (tag 0x80); tolerate the
+    // explicit OCTET STRING (0x04) and the constructed wrapper (0xA0).
+    let (t7, c_s, c_e) = tlvr(payload, p7)?.0;
+    let cipher: Vec<u8> = match t7 {
+        0x04 | 0x80 => payload[c_s..c_e].to_vec(),
+        0xA0 => {
+            let (t8, in_s, in_e) = tlvr(payload, c_s)?.0;
+            if t8 != 0x04 {
+                return Ok(());
+            }
+            payload[in_s..in_e].to_vec()
+        }
+        _ => return Ok(()),
+    };
+    // The full AlgorithmIdentifier DER (tag+len+content) starts at p6.
+    let plain = decrypt_bag(&payload[p6..p7], &oid, &salt, iterations, cipher, password)?;
     if looks_like_safe_contents(&plain) {
         walk_safe_contents(&plain, password, out)?;
     }

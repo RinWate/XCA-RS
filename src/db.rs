@@ -13,7 +13,7 @@ use crate::xca_format as xf;
 use openssl::pkey::{PKey, Public};
 use openssl::symm::Cipher;
 use openssl::x509::{X509, X509Crl, X509Req};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 
 /// Failure modes of [`Db::open`].
@@ -121,6 +121,83 @@ fn s<T: std::fmt::Display>(e: T) -> String {
     e.to_string()
 }
 
+/// Superblock magic numbers of network filesystems: SMB/CIFS, NFS and
+/// FUSE-style mounts do not provide working POSIX advisory locks, so
+/// SQLite's default fcntl locking fails there with "database is locked".
+const NETFS_MAGICS: [u64; 8] = [
+    0x517B,     // smbfs (legacy)
+    0xFF534D42, // cifs — SMB1/SMB2/SMB3 mounts
+    0xFE534D42, // smb2 (separate magic on newer kernels)
+    0x6969,     // nfs
+    0x5346414F, // afs
+    0x00C36400, // ceph
+    0x31323634, // 9p/virtfs
+    0x46554655, // fuse — sshfs and friends
+];
+
+/// True when `path` (or, for a file that does not exist yet, its
+/// directory — a fresh database is created there) sits on a network
+/// filesystem. Uses `statfs(2)`; any failure simply means "not network".
+fn is_network_fs(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut probe = path.to_path_buf();
+    if !probe.is_dir() {
+        if let Some(parent) = probe.parent() {
+            // A missing file is where it will be created — ask the parent.
+            probe = parent.to_path_buf();
+        }
+    }
+    let Ok(c) = std::ffi::CString::new(probe.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path, `st` is zeroed storage.
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    rc == 0 && NETFS_MAGICS.contains(&(st.f_type as u64))
+}
+
+/// `file:` URI for `path` with every byte outside the RFC 3986
+/// unreserved set (plus `/`) percent-encoded — required so that `?`,
+/// `#`, spaces and non-ASCII names survive in the query-suffixed URIs
+/// built by [`open_connection`].
+fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Open the SQLite file for [`Db::open`]/[`migrate_old`].
+///
+/// On network filesystems (SMB shares etc.) byte-range locks are
+/// unreliable, and SQLite cannot even start a transaction — the
+/// well-known "database is locked". There the connection is opened with
+/// `nolock=1`, the app-side equivalent of mounting cifs with `nobrl`:
+/// this program holds the only connection, so the trade-off only rules
+/// out concurrent access from several machines at once.
+fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = if is_network_fs(path) {
+        Connection::open_with_flags(
+            format!("{}?nolock=1", file_uri(path)),
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    } else {
+        Connection::open(path)?
+    };
+    // SQLite's busy timeout is 0 by default: without this, any
+    // concurrent local reader/writer turns into an instant
+    // "database is locked" instead of a short wait.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// AES-256-CBC for the PKCS#8 (PBES2) encryption of private keys — the
 /// same cipher the original XCA uses.
 fn aes256_cbc() -> Cipher {
@@ -154,7 +231,7 @@ impl Db {
                 // wrong password must never terminate the application.
                 return migrate_old(path, password);
             }
-            let conn = Connection::open(path)?;
+            let conn = open_connection(path)?;
             let old = is_old_schema(&conn)?;
             drop(conn);
             if old {
@@ -162,7 +239,7 @@ impl Db {
             }
         }
 
-        let conn = Connection::open(path)?;
+        let conn = open_connection(path)?;
         // The original XCA never enables SQLite foreign-key enforcement, so
         // neither do we: real databases migrated through old XCA versions
         // keep legacy tables (e.g. "revoked") whose FK definitions do not
@@ -262,6 +339,15 @@ impl Db {
             )
             .map_err(s)?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Change the internal name shown for an item (key, certificate,
+    /// request, CRL) — the `items.name` column the original XCA reads too.
+    pub fn rename_item(&self, id: i64, new_name: &str) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE items SET name = ?2 WHERE id = ?1", params![id, new_name])
+            .map_err(s)?;
+        Ok(())
     }
 
     // ---- settings ----
@@ -944,7 +1030,7 @@ fn migrate_old(path: &Path, password: Option<&str>) -> Result<Db, OpenError> {
         rows.collect()
     }
 
-    let conn = Connection::open(path)?;
+    let conn = open_connection(path)?;
     if let Some(pw) = password {
         let esc = pw.replace('\'', "''");
         conn.execute_batch(&format!("PRAGMA key = '{esc}';"))?;
@@ -1087,6 +1173,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn file_uri_percent_encodes() {
+        use std::os::unix::ffi::OsStrExt;
+        let plain = Path::new("/home/u/db.xdb");
+        assert_eq!(file_uri(plain), "file:///home/u/db.xdb");
+
+        let tricky = Path::new("/mnt/smb/IT/Дадаев/XCA/база ?#1.xdb");
+        let uri = file_uri(tricky);
+        // A raw '?' or '#' would be taken for a query/fragment separator.
+        assert!(!uri.contains(['?', '#']));
+
+        // The escaped path decodes back to the original bytes.
+        let mut decoded = Vec::new();
+        let mut rest = &uri["file://".len()..];
+        while let Some(i) = rest.find('%') {
+            decoded.extend_from_slice(rest[..i].as_bytes());
+            decoded.push(u8::from_str_radix(&rest[i + 1..i + 3], 16).unwrap());
+            rest = &rest[i + 3..];
+        }
+        decoded.extend_from_slice(rest.as_bytes());
+        assert_eq!(decoded, tricky.as_os_str().as_bytes());
+    }
+
+    #[test]
+    fn network_fs_detection_off_on_local_disks() {
+        // No false positives for the common local filesystems: the
+        // temp dir is tmpfs/ext4/overlay in every test environment.
+        assert!(!is_network_fs(&std::env::temp_dir()));
+        assert!(!is_network_fs(&std::env::temp_dir().join("not-yet-created.xdb")));
+        assert!(!is_network_fs(Path::new("/")));
+    }
+
+    #[test]
+    fn uri_connection_roundtrip() {
+        // The nolock branch of open_connection cannot be triggered
+        // without a network mount, so exercise the URI mechanics
+        // directly: a database created through a ?nolock=1 URI must
+        // behave like a normally opened one.
+        let dir = tmpdir("uri");
+        let path = dir.join("база 1.xdb");
+        let conn = Connection::open_with_flags(
+            format!("{}?nolock=1", file_uri(&path)),
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
+            .unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 42);
     }
 
     fn ca_cert() -> (PKey<openssl::pkey::Private>, X509, Vec<u8>) {
@@ -1559,6 +1698,27 @@ mod tests {
             .values()
             .any(|s| s.contains("aa")));
         assert_eq!(db.get_setting("pkcs11-module").as_deref(), Some("/lib/x.so"));
+    }
+
+    #[test]
+    fn rename_item_updates_internal_name() {
+        let dir = tmpdir("rename");
+        let path = dir.join("r.xdb");
+        let key = crypto::generate_key(NewKeyKind::Rsa2048).unwrap();
+        let pem = key.private_key_to_pem_pkcs8().unwrap();
+        let id = {
+            let db = Db::open(&path, None).unwrap();
+            db.insert_key("old name", &pem).unwrap()
+        };
+        // The new name survives a reopen — it is the stored items.name,
+        // not an in-memory patch.
+        {
+            let db = Db::open(&path, None).unwrap();
+            assert_eq!(db.list_keys().unwrap()[0].name, "old name");
+            db.rename_item(id, "new name").unwrap();
+        }
+        let db = Db::open(&path, None).unwrap();
+        assert_eq!(db.list_keys().unwrap()[0].name, "new name");
     }
 
     /// Manual check against a real original-XCA database:

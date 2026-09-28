@@ -334,6 +334,58 @@ impl App {
         }
     }
 
+    /// Rename the selected key or certificate (its internal name).
+    pub fn rename_selected(&self) {
+        let (id, name, title) = match self.current_page().as_deref() {
+            Some("keys") => match self.selected_key() {
+                Some(k) => (k.id, k.name, tr!("Rename Key")),
+                None => return self.toast(&tr!("Select a key first")),
+            },
+            Some("certs") => match self.selected_cert() {
+                Some(c) => (c.id, c.name, tr!("Rename Certificate")),
+                None => return self.toast(&tr!("Select a certificate first")),
+            },
+            _ => return,
+        };
+        let dlg = adw::AlertDialog::new(Some(&title), None);
+        let entry = gtk::Entry::new();
+        entry.set_text(&name);
+        dlg.set_extra_child(Some(&entry));
+        dlg.set_default_response(Some("rename"));
+        dlg.add_response("cancel", &tr!("Cancel"));
+        dlg.add_response("rename", &tr!("Rename"));
+        let app = self.clone();
+        dlg.choose(
+            Some(&self.window),
+            None::<&gtk::gio::Cancellable>,
+            move |resp| {
+                if resp.as_str() != "rename" {
+                    return;
+                }
+                let new = entry.text().trim().to_string();
+                if new.is_empty() {
+                    return dialogs::error_dialog(&app.window, &tr!("The name cannot be empty"));
+                }
+                if new == name {
+                    return;
+                }
+                let res = app
+                    .db
+                    .lock()
+                    .unwrap()
+                    .rename_item(id, &new)
+                    .map_err(|e| e.to_string());
+                match res {
+                    Ok(()) => {
+                        app.refresh();
+                        app.toast(&tr!("Renamed"));
+                    }
+                    Err(e) => dialogs::error_dialog(&app.window, &e),
+                }
+            },
+        );
+    }
+
     pub fn import_dialog(&self) {
         dialogs::import::open(self);
     }
