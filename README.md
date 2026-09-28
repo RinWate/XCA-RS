@@ -134,9 +134,6 @@ cargo test
 - **Debian**: `packaging/deb/build.sh` → `xca-rs_…_amd64.deb` (использует
   `dpkg-deb`, а при его отсутствии собирает пакет вручную через `ar`+`tar`).
 
-Debian-скрипт собирает из локальной рабочей копии; в диалоге «О приложении»
-указан автор — Denis "RinWate" Egorov <rinwate@yandex.ru>
-(https://github.com/RinWate).
 
 ## Лицензия
 
