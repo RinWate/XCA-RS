@@ -488,12 +488,13 @@ impl App {
     }
 
     pub fn about(&self) {
-        adw::AboutDialog::builder()
+        let dlg = adw::AboutDialog::builder()
             .application_name("XCA RS")
             .version(env!("CARGO_PKG_VERSION"))
             .comments(format!(
-                "{}\n\nE-mail: rinwate@yandex.ru",
-                tr!("Certificate and key management — a Rust rewrite of XCA using GTK4 and libadwaita")
+                "{}\n\n{}\n\nE-mail: rinwate@yandex.ru",
+                tr!("Certificate and key management — a Rust rewrite of XCA using GTK4 and libadwaita"),
+                tr!("An independent reimplementation of the ideas of XCA — X Certificate and Key Management")
             ))
             .website("https://github.com/RinWate")
             .developer_name("Denis \"RinWate\" Egorov")
@@ -501,8 +502,21 @@ impl App {
                 ["Denis \"RinWate\" Egorov https://github.com/RinWate"].as_slice(),
             )
             .license_type(gtk::License::Gpl20Only)
-            .build()
-            .present(Some(&self.window));
+            .build();
+        // The original XCA: its author joins the credits (with the project
+        // link), and its license gets a dedicated legal section — adw's own
+        // layout, no hand-rolled forms.
+        dlg.add_credit_section(
+            Some(&tr!("The original XCA")),
+            ["Christian Hohnstaedt (chris2511) https://github.com/chris2511/xca"].as_slice(),
+        );
+        dlg.add_legal_section(
+            &tr!("The original XCA"),
+            Some("Copyright (C) 2001 - 2021 Christian Hohnstaedt."),
+            gtk::License::Bsd3,
+            None,
+        );
+        dlg.present(Some(&self.window));
     }
 }
 

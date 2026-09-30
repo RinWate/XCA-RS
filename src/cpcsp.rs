@@ -567,7 +567,7 @@ fn key_matches(key: &PKey<Private>, cert: Option<&X509>, public8: Option<&[u8; 8
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn hex(b: &[u8]) -> String {
@@ -799,9 +799,24 @@ mod pfx_manual {
                 .unwrap_or_else(|_| "~/Сертификаты".into())
                 .replace('~', &std::env::var("HOME").unwrap_or_default()),
         );
+        // All inputs come from the environment (XCA_TEST_CRYPTOPRO_FILES,
+        // a comma-separated list of filenames inside XCA_TEST_CRYPTOPRO_DIR)
+        // — no certificate filenames, especially of private individuals,
+        // belong in the repo.
+        let names: Vec<String> = std::env::var("XCA_TEST_CRYPTOPRO_FILES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if names.is_empty() {
+            eprintln!("skipping: XCA_TEST_CRYPTOPRO_FILES is not set");
+            return;
+        }
         let mut checked = 0;
-        for name in ["Администрация.pfx", "ВДУ.pfx"] {
-            let path = dir.join(name);
+        for name in names {
+            let path = dir.join(&name);
             let Ok(data) = std::fs::read(&path) else {
                 eprintln!("skipping: {} not found", path.display());
                 continue;
@@ -972,17 +987,7 @@ fn handle_content_info(payload: &[u8], password: &str, out: &mut GostPfx) -> Res
         return Ok(());
     }
     // The full AlgorithmIdentifier DER (tag+len+content) for OpenSSL.
-    let plain = decrypt_bag(&inner[..p5], &oid, &salt, iterations, inner[c_s..c_e].to_vec(), password)
-        .map_err(|e| {
-            let _ = std::fs::write("/tmp/ci2dbg.txt", format!("CI oid={oid} err={e}"));
-            e
-        })?;
-    if std::env::var("XCA_PFX_DEBUG").is_ok() {
-        let _ = std::fs::write(
-            "/tmp/ci2dbg.txt",
-            format!("CI oid={oid} plain head {:02X?}", &plain[..plain.len().min(12)]),
-        );
-    }
+    let plain = decrypt_bag(&inner[..p5], &oid, &salt, iterations, inner[c_s..c_e].to_vec(), password)?;
     if looks_like_safe_contents(&plain) {
         walk_safe_contents(&plain, password, out)?;
     }
@@ -1499,33 +1504,61 @@ fn p12_pbe_crypt(alg: &[u8], password: &str, cipher: &[u8]) -> Result<Vec<u8>, S
         if alg_obj.is_null() {
             return Err("bad encryption algorithm".to_string());
         }
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut out_len = 0i32;
-        let rc = PKCS12_pbe_crypt(
-            alg_obj,
-            password.as_ptr().cast(),
-            password.len() as i32,
-            cipher.as_ptr(),
-            cipher.len() as i32,
-            &mut out,
-            &mut out_len,
-            0,
-        );
-        X509_ALGOR_free(alg_obj);
-        if rc.is_null() {
-            return Err(crate::tr!(
-                "Wrong password or an unsupported key container."
-            ));
+        // An empty password has two PKCS#12 key-derivation flavors: OpenSSL
+        // turns a non-NULL pass into UTF-16 with a trailing NUL, while a
+        // NULL pass means no password bytes at all. CryptoPro CSP writes
+        // passwordless PFX in the second form, so for an empty password try
+        // both derivations. A wrong key can still pass the CBC padding
+        // check (~1/256), so a decryption result is preferred only when it
+        // looks like the DER it should be (a SEQUENCE). The FIRST
+        // DER-looking result wins; the first result overall is kept as a
+        // fallback for exotic plaintexts (callers re-validate by parsing).
+        let mut attempts: Vec<(*const std::ffi::c_char, std::ffi::c_int)> =
+            vec![(password.as_ptr().cast(), password.len() as i32)];
+        if password.is_empty() {
+            attempts.push((std::ptr::null(), 0));
         }
-        let plain = std::slice::from_raw_parts(out, out_len.max(0) as usize).to_vec();
-        CRYPTO_free(out, std::ptr::null(), 0);
-        Ok(plain)
+        unsafe extern "C" {
+            fn ERR_clear_error();
+        }
+        let mut fallback: Option<Vec<u8>> = None;
+        for (pass, passlen) in attempts {
+            ERR_clear_error();
+            let mut out: *mut u8 = std::ptr::null_mut();
+            let mut out_len = 0i32;
+            let rc = PKCS12_pbe_crypt(
+                alg_obj,
+                pass,
+                passlen,
+                cipher.as_ptr(),
+                cipher.len() as i32,
+                &mut out,
+                &mut out_len,
+                0,
+            );
+            if !rc.is_null() {
+                let plain =
+                    std::slice::from_raw_parts(out, out_len.max(0) as usize).to_vec();
+                CRYPTO_free(out, std::ptr::null(), 0);
+                if plain.first().is_some_and(|&b| b == 0x30) {
+                    fallback = Some(plain);
+                    break;
+                }
+                fallback = fallback.or(Some(plain));
+            }
+        }
+        ERR_clear_error();
+        X509_ALGOR_free(alg_obj);
+        fallback.ok_or_else(|| {
+            crate::tr!(
+                "Wrong password or an unsupported key container."
+            )
+        })
     }
 }
 
 /// SafeContents ::= SEQ of SafeBag.
 fn walk_safe_contents(payload: &[u8], password: &str, out: &mut GostPfx) -> Result<(), String> {
-    let _ = std::fs::write("/tmp/wsc.txt", format!("walk payload len {} head {:02X?}", payload.len(), &payload[..payload.len().min(12)]));
     let ((_, seq_s, seq_e), _) = tlvr(payload, 0)?;
     let mut pos = seq_s;
     while pos < seq_e {
@@ -1550,7 +1583,6 @@ fn handle_safe_bag(
         return Ok(());
     }
     let bag = oid_text(&payload[os..oe]);
-    let _ = std::fs::write("/tmp/wsc.txt", format!("bag {bag}"));
     let (t2, v_s, _) = tlvr(payload, p2)?.0;
     if t2 != 0xA0 {
         return Ok(());
@@ -1592,10 +1624,6 @@ fn handle_safe_bag(
         while p < value.len() {
             let Some(((tag, a, _b), next)) = tlv(value, p) else { break };
             if tag == 0xA0 {
-                let dbg = tlv(value, a).map(|((t6, s6, e6), _)| {
-                    format!("inner tag {t6:02X} len {} parse={}", e6 - s6, X509::from_der(&value[s6..e6]).is_ok())
-                }).unwrap_or_else(|| "no inner tlv".into());
-                let _ = std::fs::write("/tmp/certdbg.txt", dbg);
                 if let Some(((t6, s6, e6), _)) = tlv(value, a)
                     && t6 == 0x04
                         && let Ok(cert) = X509::from_der(&value[s6..e6]) {
@@ -1680,10 +1708,16 @@ mod pfx_probe {
     #[test]
     #[ignore]
     fn pfx_probe_real() {
-        let data = match std::fs::read("Сертификат/Егоров.pfx") {
+        // XCA_TEST_PFX names a passwordless CSP5 container; no defaults —
+        // certificate filenames do not belong in the repo.
+        let Ok(pfx) = std::env::var("XCA_TEST_PFX") else {
+            eprintln!("skipping: XCA_TEST_PFX is not set");
+            return;
+        };
+        let data = match std::fs::read(&pfx) {
             Ok(d) => d,
-            Err(_) => {
-                eprintln!("no real PFX in the tree — skipped");
+            Err(e) => {
+                eprintln!("cannot read {pfx}: {e} — skipped");
                 return;
             }
         };

@@ -65,6 +65,30 @@ fn is_pdf_path(p: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
+/// `Signature Type` combo indexes for PDFs — the same order the items are
+/// declared in; every reader goes through these constants.
+const PDF_KIND_ATTACHED: u32 = 0;
+const PDF_KIND_DETACHED: u32 = 1;
+
+/// `Detached signature file type` combo indexes → signature extensions.
+const PDF_SIG_EXTS: [&str; 3] = ["sgn", "p7s", "sig"];
+
+/// `Signature Profile` combo indexes.
+const PDF_PROFILE_CADES: u32 = 0;
+const PDF_PROFILE_PKCS7: u32 = 1;
+
+/// A fresh `<stem> подписано` folder next to the source file, suffixed
+/// `(2)`, `(3)`… while the name is taken.
+fn unique_signed_folder(parent: &std::path::Path, stem: &str) -> PathBuf {
+    let mut folder = parent.join(format!("{} {}", stem, tr!("signed")));
+    let mut attempt = 2u32;
+    while folder.exists() {
+        folder = parent.join(format!("{} {} ({attempt})", stem, tr!("signed")));
+        attempt += 1;
+    }
+    folder
+}
+
 pub fn open_sign(app: &App) {
     let certs = app.db.lock().unwrap().list_certs().unwrap_or_default();
     let certs: Vec<(i64, String)> = certs
@@ -104,11 +128,43 @@ pub fn open_sign(app: &App) {
     let g_pdf = form.group(&tr!("PDF"));
     let g3 = form.group(&tr!("Signature"));
 
-    // PDF section (visible only when a .pdf file is chosen): the visible
-    // stamp switch and the click-to-place position row.
+    // PDF section (visible only when a .pdf file is chosen): the attached
+    // vs detached mode, the detached-signature file type, the CMS profile,
+    // the visible stamp switch and the click-to-place position row.
+    let pdf_kind_row = combo(
+        &tr!("Signature Type"),
+        &[
+            tr!("Attached — the signature is written into the PDF itself").as_str(),
+            tr!("Detached — a folder next to the file keeps the stamped PDF, the original and the signature")
+                .as_str(),
+        ],
+        0,
+    );
+    let profile_row = combo(
+        &tr!("Signature Profile"),
+        &[
+            tr!("CAdES-BES — enhanced signature with the certificate bound in").as_str(),
+            tr!("CMS (PKCS#7) — plain signature").as_str(),
+        ],
+        PDF_PROFILE_CADES,
+    );
+    let detached_type_row = combo(
+        &tr!("Detached signature file type"),
+        &[
+            tr!("SGN — CryptoPro, SED, SBIS").as_str(),
+            tr!("P7S — international CMS").as_str(),
+            tr!("SIG — some state portals").as_str(),
+        ],
+        0,
+    );
     let stamp_sw = switch(
         &tr!("Show stamp in the document"),
         &tr!("Draw the signature plate with the signer, date and fingerprint on the page."),
+        true,
+    );
+    let save_orig_sw = switch(
+        &tr!("Save the original"),
+        &tr!("The original file stays untouched; the signed copy is created next to it."),
         true,
     );
     let pos_row = action_row(&tr!("Stamp Position"), &tr!("Not placed yet"));
@@ -143,6 +199,9 @@ pub fn open_sign(app: &App) {
             let stamp_sw = stamp_sw.clone();
             let g_pdf = g_pdf.clone();
             let kind_row = kind_row.clone();
+            let detached_type_row = detached_type_row.clone();
+            let save_orig_sw = save_orig_sw.clone();
+            let pdf_kind_row = pdf_kind_row.clone();
             move |p: &std::path::Path| {
                 let pdf = is_pdf_path(p);
                 is_pdf.set(pdf);
@@ -152,15 +211,38 @@ pub fn open_sign(app: &App) {
                 // The embedded signature replaces the p7s/p7m choice.
                 g_pdf.set_visible(pdf);
                 kind_row.set_visible(!pdf);
+                detached_type_row.set_visible(pdf && pdf_kind_row.selected() == PDF_KIND_DETACHED);
+                save_orig_sw.set_visible(pdf && pdf_kind_row.selected() == PDF_KIND_ATTACHED);
             }
         })),
     );
     g2.add(&file_row);
+    g_pdf.add(&pdf_kind_row);
+    g_pdf.add(&detached_type_row);
+    g_pdf.add(&profile_row);
     g_pdf.add(&stamp_sw);
+    g_pdf.add(&save_orig_sw);
     g_pdf.add(&pos_row);
     g_pdf.set_visible(false);
+    detached_type_row.set_visible(false);
+    save_orig_sw.set_visible(false);
     g3.add(&kind_row);
     g3.add(&chain_sw);
+
+    {
+        // The mode-specific rows: the signature-file type belongs to the
+        // detached mode; "Save the original" — to the attached one, where
+        // the source file is overwritten in place.
+        let is_pdf = is_pdf.clone();
+        let detached_type_row = detached_type_row.clone();
+        let save_orig_sw = save_orig_sw.clone();
+        pdf_kind_row.connect_notify_local(Some("selected"), move |row, _| {
+            let detached = is_pdf.get() && row.selected() == PDF_KIND_DETACHED;
+            let attached = is_pdf.get() && row.selected() == PDF_KIND_ATTACHED;
+            detached_type_row.set_visible(detached);
+            save_orig_sw.set_visible(attached);
+        });
+    }
 
     {
         // The stamp switch gates the position row.
@@ -215,6 +297,10 @@ pub fn open_sign(app: &App) {
         let cert_ids = cert_ids.clone();
         let file_path = file_path.clone();
         let kind_row = kind_row.clone();
+        let pdf_kind2 = pdf_kind_row.clone();
+        let pdf_type2 = detached_type_row.clone();
+        let profile2 = profile_row.clone();
+        let save_orig2 = save_orig_sw.clone();
         let chain_sw = chain_sw.clone();
         let is_pdf2 = is_pdf.clone();
         let placement2 = placement.clone();
@@ -227,6 +313,12 @@ pub fn open_sign(app: &App) {
             SignatureKind::Attached
         };
         let pdf_mode = is_pdf2.get();
+        let pdf_detached = pdf_kind2.selected() == PDF_KIND_DETACHED;
+        let profile = if profile2.selected() == PDF_PROFILE_PKCS7 {
+            crypto::SignatureProfile::Pkcs7
+        } else {
+            crypto::SignatureProfile::CadesBes
+        };
         let result = (|| -> Result<std::path::PathBuf, String> {
             let cert_id = cert_id.ok_or(tr!("Select a certificate"))?;
             let path = file_path
@@ -263,8 +355,9 @@ pub fn open_sign(app: &App) {
             let key = crypto::load_private_key(&key_rec.pem)?;
 
             if pdf_mode {
-                // PDF: an incremental update with the embedded signature,
-                // written back into the same file.
+                // PDF: either an embedded signature written back into the
+                // same file, or a detached one dropped into a fresh folder
+                // next to it.
                 let data = std::fs::read(&path)
                     .map_err(|e| format!("{}: {e}", tr!("Read error")))?;
                 let stamp = if stamp_sw2.is_active() {
@@ -300,11 +393,90 @@ pub fn open_sign(app: &App) {
                 } else {
                     None
                 };
+
+                if pdf_detached {
+                    // Detached: the signature is made over the ORIGINAL
+                    // document (the formular) — the pair the recipients
+                    // verify. The stamped copy is a separate print version,
+                    // not the signed artifact. The formular always lands in
+                    // the folder next to the signature file and the print
+                    // version; the source file itself stays untouched.
+                    let der = crypto::sign_file_ex(
+                        cert.as_ref(),
+                        key.as_ref(),
+                        &data,
+                        SignatureKind::Detached,
+                        &chain,
+                        profile,
+                    )?;
+                    let stamped = match stamp.as_ref() {
+                        Some(s) => Some(pdf_sign::stamp_pdf(&data, cert.as_ref(), Some(s))?),
+                        None => None,
+                    };
+                    let parent = path.parent().map(PathBuf::from).unwrap_or_default();
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let folder = unique_signed_folder(&parent, &stem);
+                    if let Err(e) = std::fs::create_dir_all(&folder) {
+                        let _ = std::fs::remove_dir_all(&folder);
+                        return Err(tr!(
+                            "Cannot create the output folder: %{err}",
+                            err = e.to_string()
+                        ));
+                    }
+                    // A half-written folder is worse than none: drop it on
+                    // any write error so a retry starts clean.
+                    let write = |name: &str, bytes: &[u8]| -> Result<(), String> {
+                        std::fs::write(folder.join(name), bytes).map_err(|e| {
+                            format!("{} {name}: {e}", tr!("Write error"))
+                        })
+                    };
+                    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+                    files.push((format!("{stem} ({}).pdf", tr!("form")), data.clone()));
+                    let sig_ext = PDF_SIG_EXTS[pdf_type2.selected() as usize % PDF_SIG_EXTS.len()];
+                    files.push((format!("{stem}.{sig_ext}"), der));
+                    if let Some(stamped) = stamped {
+                        files.push((format!("{stem} ({}).pdf", tr!("for printing")), stamped));
+                    }
+                    for (name, bytes) in files {
+                        if let Err(e) = write(&name, &bytes) {
+                            let _ = std::fs::remove_dir_all(&folder);
+                            return Err(e);
+                        }
+                    }
+                    return Ok(folder);
+                }
+
+                // Attached: the signature is written into the file itself.
+                // With "Save the original" on, the source file stays
+                // untouched and the signed version is created next to it;
+                // without it the original is signed in place.
                 let signed =
-                    pdf_sign::sign_pdf(&data, cert.as_ref(), key.as_ref(), &chain, stamp.as_ref())?;
-                std::fs::write(&path, signed)
+                    pdf_sign::sign_pdf_ex(&data, cert.as_ref(), key.as_ref(), &chain, stamp.as_ref(), profile)?;
+                let out_path = if save_orig2.is_active() {
+                    let parent = path.parent().map(PathBuf::from).unwrap_or_default();
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let mut out = parent.join(format!("{stem} ({}).pdf", tr!("signed")));
+                    let mut attempt = 2u32;
+                    while out.exists() {
+                        out = parent.join(format!(
+                            "{stem} ({} ({attempt})).pdf",
+                            tr!("signed")
+                        ));
+                        attempt += 1;
+                    }
+                    out
+                } else {
+                    path.clone()
+                };
+                std::fs::write(&out_path, signed)
                     .map_err(|e| format!("{}: {e}", tr!("Write error")))?;
-                return Ok(path);
+                return Ok(out_path);
             }
 
             let data = std::fs::read(&path)
@@ -323,7 +495,12 @@ pub fn open_sign(app: &App) {
 
         match result {
             Ok(out) => {
-                let msg = if pdf_mode {
+                let msg = if pdf_mode && pdf_detached {
+                    tr!(
+                        "Detached PDF signature created: %{dir}",
+                        dir = out.to_string_lossy().to_string()
+                    )
+                } else if pdf_mode {
                     tr!("PDF signed: %{file}", file = out.to_string_lossy().to_string())
                 } else {
                     tr!("Signature created: %{file}", file = out.to_string_lossy().to_string())
@@ -338,13 +515,17 @@ pub fn open_sign(app: &App) {
 
     // Signing an already-signed PDF keeps every previous revision (and
     // its stamp) forever — make that explicit before adding another one.
+    // Detached signing leaves the source file untouched, so it needs no
+    // confirmation.
     {
         let app2 = app.clone();
         let is_pdf2 = is_pdf.clone();
+        let pdf_kind3 = pdf_kind_row.clone();
         let file_path = file_path.clone();
         let perform = perform.clone();
         sign.connect_clicked(move |_| {
             let already_signed = is_pdf2.get()
+                && pdf_kind3.selected() == PDF_KIND_ATTACHED
                 && file_path
                     .borrow()
                     .clone()
@@ -377,7 +558,8 @@ pub fn open_sign(app: &App) {
 
 pub fn open_verify(app: &App) {
     let form = form_dialog(&tr!("Verify Signature"), 520);
-    let (sig_row, sig_path) = file_row(&app.window, &tr!("Signature file (.p7s / .p7m)"), None);
+    let (sig_row, sig_path) =
+        file_row(&app.window, &tr!("Signature file (.p7s / .p7m / .sgn / .sig)"), None);
     let (data_row, data_path) = file_row(
         &app.window,
         &tr!("Original file (for a detached signature)"),

@@ -5,7 +5,7 @@
 
 use openssl::asn1::{Asn1Integer, Asn1Time};
 use openssl::bn::{BigNum, MsbOption};
-use openssl::cms::{CmsContentInfo, CMSOptions};
+use openssl::cms::{CmsContentInfo, CmsContentInfoRef, CMSOptions};
 use openssl::ec::{EcGroup, EcKey};
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
@@ -878,9 +878,22 @@ pub enum SignatureKind {
     Attached,
 }
 
+/// The CMS profile a signature is built with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SignatureProfile {
+    /// CAdES-BES: the signing-certificate-v2 attribute binds the signature
+    /// to an exact certificate — the profile Russian document flow expects
+    /// (CryptoPro verifiers report plain PKCS#7 without it).
+    #[default]
+    CadesBes,
+    /// Plain CMS SignedData (PKCS#7) without CAdES attributes.
+    Pkcs7,
+}
+
 /// Sign file bytes as CMS SignedData (PKCS#7 DER). `chain` certificates
 /// (e.g. the issuing CAs) are embedded alongside the signer certificate,
 /// so the signature can be verified without access to the database.
+/// Uses the default profile (CAdES-BES).
 pub fn sign_file(
     cert: &X509Ref,
     key: &PKeyRef<Private>,
@@ -888,9 +901,27 @@ pub fn sign_file(
     kind: SignatureKind,
     chain: &[X509],
 ) -> CryptoResult<Vec<u8>> {
+    sign_file_ex(cert, key, data, kind, chain, SignatureProfile::default())
+}
+
+/// `sign_file` with an explicit CMS profile.
+pub fn sign_file_ex(
+    cert: &X509Ref,
+    key: &PKeyRef<Private>,
+    data: &[u8],
+    kind: SignatureKind,
+    chain: &[X509],
+    profile: SignatureProfile,
+) -> CryptoResult<Vec<u8>> {
     let mut flags = CMSOptions::BINARY | CMSOptions::NOSMIMECAP;
     if matches!(kind, SignatureKind::Detached) {
         flags |= CMSOptions::DETACHED;
+    }
+    // PARTIAL keeps the signer infos open for the CAdES attribute;
+    // finalize_cades then digests the data and completes the signatures.
+    let cades = matches!(profile, SignatureProfile::CadesBes);
+    if cades {
+        flags |= CMSOptions::PARTIAL;
     }
     let extra = if chain.is_empty() {
         None
@@ -909,7 +940,174 @@ pub fn sign_file(
         flags,
     )
     .map_err(|e| format!("CMS signing failed: {e}"))?;
+    if cades {
+        finalize_cades(&cms, cert, data, flags)?;
+    }
     cms.to_der().map_err(err)
+}
+
+/// Splice the CAdES signing-certificate-v2 attribute (RFC 5035,
+/// 1.2.840.113549.1.9.16.2.47) into every signer info of a `CMS_PARTIAL`
+/// CMS and finalize the signatures with `CMS_final` (a partial CMS has not
+/// digested the data yet). The attribute carries the SHA-256 hash of the
+/// signing certificate plus its issuer/serial, letting verifiers bind the
+/// signature to an exact certificate — the mark of CAdES-BES.
+fn finalize_cades(
+    cms: &CmsContentInfoRef,
+    cert: &X509Ref,
+    data: &[u8],
+    flags: CMSOptions,
+) -> Result<(), String> {
+    unsafe extern "C" {
+        fn CMS_get0_SignerInfos(
+            cms: *mut openssl_sys::CMS_ContentInfo,
+        ) -> *mut std::ffi::c_void;
+        fn CMS_signed_add1_attr(
+            si: *mut std::ffi::c_void,
+            attr: *mut openssl_sys::X509_ATTRIBUTE,
+        ) -> std::ffi::c_int;
+        fn d2i_X509_ATTRIBUTE(
+            a: *mut *mut openssl_sys::X509_ATTRIBUTE,
+            pp: *mut *const u8,
+            len: std::ffi::c_long,
+        ) -> *mut openssl_sys::X509_ATTRIBUTE;
+        fn X509_ATTRIBUTE_free(a: *mut openssl_sys::X509_ATTRIBUTE);
+        fn CMS_final(
+            cms: *mut openssl_sys::CMS_ContentInfo,
+            data: *mut openssl_sys::BIO,
+            dcont: *mut openssl_sys::BIO,
+            flags: std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+        fn OPENSSL_sk_num(st: *mut std::ffi::c_void) -> std::ffi::c_int;
+        fn OPENSSL_sk_value(
+            st: *mut std::ffi::c_void,
+            i: std::ffi::c_int,
+        ) -> *mut std::ffi::c_void;
+    }
+    // The full X509_ATTRIBUTE DER: SEQ { OID, SET { SigningCertificateV2 } }.
+    let attr_der = signing_certificate_v2_der(cert)?;
+    unsafe {
+        let sis = CMS_get0_SignerInfos(cms.as_ptr());
+        if sis.is_null() {
+            return Err("CMS has no signer infos".into());
+        }
+        let n = OPENSSL_sk_num(sis);
+        for i in 0..n {
+            let si = OPENSSL_sk_value(sis, i);
+            if si.is_null() {
+                continue;
+            }
+            let mut p = attr_der.as_ptr();
+            let attr = d2i_X509_ATTRIBUTE(
+                std::ptr::null_mut(),
+                &mut p,
+                attr_der.len() as std::ffi::c_long,
+            );
+            if attr.is_null() {
+                let e = drain_openssl_errors();
+                return Err(format!(
+                    "signing-certificate-v2 attribute did not parse: {e}"
+                ));
+            }
+            let a_ok = CMS_signed_add1_attr(si, attr) == 1;
+            X509_ATTRIBUTE_free(attr);
+            if !a_ok {
+                let e = drain_openssl_errors();
+                return Err(format!("CAdES attribute add failed: {e}"));
+            }
+        }
+        // Digest the data and complete every signer (messageDigest attr,
+        // signature over the whole signedAttrs set including ours).
+        unsafe extern "C" {
+            fn BIO_new_mem_buf(buf: *const u8, len: std::ffi::c_int) -> *mut openssl_sys::BIO;
+            fn BIO_free(b: *mut openssl_sys::BIO) -> std::ffi::c_int;
+        }
+        let bio = BIO_new_mem_buf(data.as_ptr(), data.len() as std::ffi::c_int);
+        if bio.is_null() {
+            return Err("CAdES bio".into());
+        }
+        let fin = CMS_final(cms.as_ptr(), bio, std::ptr::null_mut(), flags.bits());
+        BIO_free(bio);
+        if fin != 1 {
+            let e = drain_openssl_errors();
+            return Err(format!("CMS_final failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Drain the OpenSSL error queue into a newline-joined string, leaving it
+/// clean for the next failure report.
+fn drain_openssl_errors() -> String {
+    unsafe extern "C" {
+        fn ERR_get_error() -> std::ffi::c_ulong;
+        fn ERR_error_string_n(e: std::ffi::c_ulong, buf: *mut std::ffi::c_char, len: usize);
+    }
+    let mut msg = String::new();
+    unsafe {
+        loop {
+            let e = ERR_get_error();
+            if e == 0 {
+                break;
+            }
+            let mut buf = [0i8; 256];
+            ERR_error_string_n(e, buf.as_mut_ptr().cast(), 256);
+            msg.push_str(&String::from_utf8_lossy(
+                std::ffi::CStr::from_ptr(buf.as_ptr().cast()).to_bytes(),
+            ));
+            msg.push('\n');
+        }
+    }
+    msg
+}
+
+/// DER of the whole signing-certificate-v2 X509_ATTRIBUTE.
+fn signing_certificate_v2_der(cert: &X509Ref) -> Result<Vec<u8>, String> {
+    // ESSCertIDv2 ::= SEQ { certHash OCTET STRING, IssuerSerial }
+    let cert_der = cert.to_der().map_err(err)?;
+    let hash = openssl::hash::hash(
+        openssl::hash::MessageDigest::sha256(),
+        &cert_der,
+    )
+    .map_err(err)?;
+    // IssuerSerial ::= SEQ { GeneralNames, SerialNumber }
+    let issuer: Vec<u8> = unsafe {
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let len = openssl_sys::i2d_X509_NAME(cert.issuer_name().as_ptr(), &mut out);
+        if len < 0 || out.is_null() {
+            return Err("issuer name DER".into());
+        }
+        let v = std::slice::from_raw_parts(out, len as usize).to_vec();
+        openssl_sys::CRYPTO_free(out.cast(), std::ptr::null(), 0);
+        v
+    };
+    // GeneralNames ::= SEQ OF GeneralName; directoryName is [4] EXPLICIT Name.
+    let gn = der_tlv(0x30, &der_tlv(0xA4, &issuer));
+    // Serial as a positive INTEGER: `to_bn().to_vec()` is the magnitude, so
+    // a (non-conformant per RFC 5280, never issued in practice) negative
+    // serial would encode as its positive form — accepted deliberately.
+    let mut mag = cert
+        .serial_number()
+        .to_bn()
+        .map_err(|e| e.to_string())?
+        .to_vec();
+    if mag.is_empty() {
+        mag.push(0);
+    }
+    if mag[0] & 0x80 != 0 {
+        mag.insert(0, 0);
+    }
+    let serial = der_tlv(0x02, &mag);
+    // IssuerSerial ::= SEQ { GeneralNames, SerialNumber }
+    let issuer_serial = der_tlv(0x30, &der_concat(&[gn, serial]));
+    // ESSCertIDv2 ::= SEQ { certHash OCTET STRING, IssuerSerial }
+    let ess = der_tlv(0x30, &der_concat(&[der_tlv(0x04, &hash), issuer_serial]));
+    // SigningCertificateV2 ::= SEQ { SEQ OF ESSCertIDv2 }
+    let value = der_tlv(0x30, &ess);
+    // OID 1.2.840.113549.1.9.16.2.47
+    let oid = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F]);
+    // X509_ATTRIBUTE ::= SEQ { OID, SET OF value }
+    Ok(der_tlv(0x30, &der_concat(&[oid, der_tlv(0x31, &value)])))
 }
 
 /// Outcome of a signature check.

@@ -35,6 +35,9 @@ pub struct StampOpts {
 /// Sign a PDF in place (incremental update). `stamp` draws a visible
 /// signature plate; without it the signature is still valid, just
 /// invisible. Returns the new file bytes — the input always prefixes them.
+/// Convenience wrapper for the default profile; the UI passes an explicit
+/// profile, so the binary itself never routes through here.
+#[allow(dead_code)]
 pub fn sign_pdf(
     bytes: &[u8],
     cert: &X509Ref,
@@ -42,7 +45,21 @@ pub fn sign_pdf(
     chain: &[X509],
     stamp: Option<&StampOpts>,
 ) -> Result<Vec<u8>, String> {
+    sign_pdf_ex(bytes, cert, key, chain, stamp, crypto::SignatureProfile::default())
+}
+
+/// `sign_pdf` with an explicit CMS profile.
+pub fn sign_pdf_ex(
+    bytes: &[u8],
+    cert: &X509Ref,
+    key: &PKeyRef<Private>,
+    chain: &[X509],
+    stamp: Option<&StampOpts>,
+    profile: crypto::SignatureProfile,
+) -> Result<Vec<u8>, String> {
     let doc = Document::load_mem(bytes).map_err(|e| format!("Not a PDF file: {e}"))?;
+    // Checked here (before the engine-touching dry run) AND in
+    // build_stamped_update, which stamp_pdf reaches on its own.
     if doc.is_encrypted() {
         return Err(crate::tr!("The PDF is password-protected; signing is not supported."));
     }
@@ -51,9 +68,37 @@ pub fn sign_pdf(
     // the signed attributes), so a dry run over a dummy digest sizes the
     // /Contents placeholder. The margin covers chain differences between
     // runs.
-    let dry = crypto::sign_file(cert, key, &[0u8; 32], SignatureKind::Detached, chain)?;
+    let dry =
+        crypto::sign_file_ex(cert, key, &[0u8; 32], SignatureKind::Detached, chain, profile)?;
     let placeholder_len = dry.len() + 64;
 
+    let mut out = build_stamped_update(&doc, bytes, cert, stamp, Some(placeholder_len))?;
+    splice_signature(&mut out, cert, key, chain, placeholder_len, profile)?;
+    Ok(out)
+}
+
+/// Draw the visible stamp as an incremental update WITHOUT an embedded
+/// signature: the page gets the plate, the signature field is added empty
+/// (no `/V`) — the CMS itself travels in a separate detached file. Returns
+/// the new file bytes; the input always prefixes them.
+pub fn stamp_pdf(bytes: &[u8], cert: &X509Ref, stamp: Option<&StampOpts>) -> Result<Vec<u8>, String> {
+    let doc = Document::load_mem(bytes).map_err(|e| format!("Not a PDF file: {e}"))?;
+    build_stamped_update(&doc, bytes, cert, stamp, None)
+}
+
+/// The shared stamping skeleton: clones the catalog (and the page when a
+/// stamp is drawn), adds the signature field (with an empty `/V`-less form
+/// when `placeholder_len` is `None`) and the `%PDF` update header.
+fn build_stamped_update(
+    doc: &Document,
+    bytes: &[u8],
+    cert: &X509Ref,
+    stamp: Option<&StampOpts>,
+    placeholder_len: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    if doc.is_encrypted() {
+        return Err(crate::tr!("The PDF is password-protected; signing is not supported."));
+    }
     let catalog_id = doc
         .trailer
         .get(b"Root")
@@ -66,61 +111,193 @@ pub fn sign_pdf(
         .get(&page_no)
         .ok_or("PDF has no pages".to_string())?;
 
-    let mut inc = IncrementalDocument::create_from(bytes.to_vec(), doc);
+    let mut inc = IncrementalDocument::create_from(bytes.to_vec(), doc.clone());
+    // Acrobat (and the verifiers following it) expect a document /ID in
+    // the trailer; producers that omit it in the original (bank print-outs
+    // are a common case) get one generated here so every revision of the
+    // file carries the identifier. The second element reflects this
+    // revision (PDF 32000-1 14.4), so it differs from the first.
+    if doc.trailer.get(b"ID").is_err() {
+        let mk_id = || -> Result<Object, String> {
+            let mut raw = [0u8; 16];
+            openssl::rand::rand_bytes(&mut raw).map_err(|e| e.to_string())?;
+            Ok(Object::String(raw.to_vec(), lopdf::StringFormat::Hexadecimal))
+        };
+        let (a, b) = (mk_id()?, mk_id()?);
+        inc.new_document.trailer.set(b"ID", Object::Array(vec![a, b]));
+    }
     inc.opt_clone_object_to_new_document(catalog_id)
         .map_err(|e| e.to_string())?;
-    inc.opt_clone_object_to_new_document(page_id)
-        .map_err(|e| e.to_string())?;
+    if stamp.is_some() {
+        inc.opt_clone_object_to_new_document(page_id)
+            .map_err(|e| e.to_string())?;
+    }
 
+    // The /AcroForm object (and the stamp appearance objects inside
+    // build_field) are created BEFORE the field itself: lopdf writes new
+    // objects in id order, and the signature field must be the very last
+    // object of the update, right before the xref. An embedded signature
+    // gets SigFlags 3; a stamp-only update registers an empty field in
+    // /Fields without SigFlags — a signature placeholder, not a claim that
+    // signatures exist.
+    let sigflags = placeholder_len.is_some();
+    let acro_id = prepare_acroform(&mut inc, catalog_id, sigflags)?;
     let field_id = build_field(&mut inc, cert, page_id, stamp, placeholder_len)?;
-    update_catalog(&mut inc, catalog_id, field_id)?;
-    update_page_annots(&mut inc, page_id, field_id)?;
+    finish_acroform(&mut inc, acro_id, field_id)?;
+    if stamp.is_some() {
+        update_page_annots(&mut inc, page_id, field_id)?;
+    }
 
     let mut out = Vec::new();
     inc.save_to(&mut out).map_err(|e| e.to_string())?;
-    splice_signature(&mut out, cert, key, chain, placeholder_len)?;
+    add_update_header(&mut out, bytes.len());
     Ok(out)
 }
 
+/// Prepend an `%PDF-x.y` header line to the incremental update. Inserting
+/// bytes shifts the update's absolute offsets, so every xref entry of the
+/// update (and its `startxref`) is fixed up by the inserted length. Must
+/// run before `splice_signature`: the /ByteRange offsets are computed from
+/// the final layout. Documents saved with a cross-reference stream (no
+/// classic `xref` table in the update) are left untouched.
+fn add_update_header(out: &mut Vec<u8>, orig_len: usize) {
+    // Match the original header's version, e.g. `%PDF-1.3`.
+    let version: Vec<u8> = out
+        .iter()
+        .take(16)
+        .take_while(|&&b| b != b'\n' && b != b'\r')
+        .copied()
+        .collect();
+    let header: Vec<u8> = if version.starts_with(b"%PDF-") {
+        let mut v = version;
+        v.push(b'\n');
+        v
+    } else {
+        b"%PDF-1.4\n".to_vec()
+    };
+    // The update starts right after the original bytes, past the separator
+    // newline lopdf appends when the original does not end with one.
+    let start = orig_len + usize::from(out.get(orig_len) == Some(&b'\n'));
+    let delta = header.len();
+    let xref_at = match out[start..].windows(5).rposition(|w| w == b"\nxref") {
+        Some(rel) => start + rel + 1,
+        None => return,
+    };
+    out.splice(start..start, header);
+
+    // Rewrite the update's xref entries: `ooo ggggg n` records whose offset
+    // points inside the update shift by `delta`; entries pointing into the
+    // original revision stay. Records are exactly 20 bytes (PDF 7.5.4).
+    let xref_at = xref_at + delta;
+    let mut pos = xref_at + 4; // past "xref"
+    while pos < out.len() {
+        // One subsection header line "first count".
+        while pos < out.len() && (out[pos] == b'\n' || out[pos] == b'\r' || out[pos] == b' ') {
+            pos += 1;
+        }
+        let eol = match out[pos..].iter().position(|&b| b == b'\n') {
+            Some(e) => pos + e,
+            None => break,
+        };
+        let header_line = String::from_utf8_lossy(&out[pos..eol]).trim().to_string();
+        if header_line.starts_with("trailer") {
+            break;
+        }
+        let parts: Vec<&str> = header_line.split_whitespace().collect();
+        let count = match parts.as_slice() {
+            [_, c] => match c.parse::<usize>() {
+                Ok(c) => c,
+                Err(_) => break,
+            },
+            _ => break,
+        };
+        pos = eol + 1;
+        for _ in 0..count {
+            let rec_end = (pos + 20).min(out.len());
+            let rec = String::from_utf8_lossy(&out[pos..rec_end]).to_string();
+            let mut fields = rec.split_whitespace();
+            let (off, kind) = (fields.next(), fields.next().and_then(|_| fields.next()));
+            if let (Some(off), Some("n")) = (off, kind)
+                && let Ok(off) = off.parse::<u64>()
+                && off as usize >= start
+                && pos + 10 <= out.len()
+            {
+                let field = format!("{:010}", off as usize + delta);
+                out[pos..pos + 10].copy_from_slice(field.as_bytes());
+            }
+            pos = rec_end;
+        }
+    }
+
+    // startxref points at the update's xref — shift it too.
+    if let Some(at) = out.windows(9).rposition(|w| w == b"startxref") {
+        let mut num_at = at + 9;
+        while num_at < out.len() && out[num_at].is_ascii_whitespace() {
+            num_at += 1;
+        }
+        let num_end = num_at + out[num_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if let Ok(v) = std::str::from_utf8(&out[num_at..num_end])
+            .map_err(|_| ())
+            .and_then(|s| s.parse::<u64>().map_err(|_| ()))
+        {
+            let shifted = v as usize + delta;
+            let field = format!("{shifted}");
+            out.splice(num_at..num_end, field.bytes().collect::<Vec<u8>>());
+        }
+    }
+}
+
 /// Create the signature field (+ appearance objects) and return its id.
+/// With `placeholder_len` set the object is a full signature field carrying
+/// a `/V` dictionary with the `/Contents` placeholder; without it, it is an
+/// empty signature field — the stamp's visual plate registered in
+/// AcroForm/Fields without SigFlags. Either way the widget is a locked
+/// signature field (`FT /Sig`, `F 132`); only the `/V` differs.
 fn build_field(
     inc: &mut IncrementalDocument,
     cert: &X509Ref,
     page_id: ObjectId,
     stamp: Option<&StampOpts>,
-    placeholder_len: usize,
+    placeholder_len: Option<usize>,
 ) -> Result<ObjectId, String> {
-    let mut sig = Dictionary::new();
-    sig.set("Type", Object::Name(b"Sig".to_vec()));
-    sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
-    sig.set("SubFilter", Object::Name(b"adbe.pkcs7.detached".to_vec()));
-    if let Some(cn) = crate::crypto::name_cn(cert.subject_name()) {
-        sig.set("Name", Object::String(cn.into_bytes(), lopdf::StringFormat::Literal));
-    }
-    sig.set("M", Object::String(pdf_date_now().into_bytes(), lopdf::StringFormat::Literal));
-    // Fixed-width dummy values: after saving, the real offsets are patched
-    // into the same character width, so nothing after the array shifts.
-    sig.set(
-        "ByteRange",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(BR_DUMMY),
-            Object::Integer(BR_DUMMY),
-            Object::Integer(BR_DUMMY),
-        ]),
-    );
-    sig.set(
-        "Contents",
-        Object::String(
-            vec![0u8; placeholder_len],
-            lopdf::StringFormat::Hexadecimal,
-        ),
-    );
-
     let mut field = Dictionary::new();
     field.set("FT", Object::Name(b"Sig".to_vec()));
     field.set("T", Object::String(b"Signature".to_vec(), lopdf::StringFormat::Literal));
-    field.set("V", Object::Dictionary(sig));
+    if let Some(placeholder_len) = placeholder_len {
+        let mut sig = Dictionary::new();
+        sig.set("Type", Object::Name(b"Sig".to_vec()));
+        sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
+        sig.set("SubFilter", Object::Name(b"adbe.pkcs7.detached".to_vec()));
+        if let Some(cn) = crate::crypto::name_cn(cert.subject_name()) {
+            // PDF text strings must carry non-ASCII (the signer CN is usually
+            // Cyrillic) as UTF-16BE with a BOM.
+            let mut name = vec![0xFE, 0xFF];
+            for u in cn.encode_utf16() {
+                name.extend_from_slice(&u.to_be_bytes());
+            }
+            sig.set("Name", Object::String(name, lopdf::StringFormat::Literal));
+        }
+        sig.set("M", Object::String(pdf_date_now().into_bytes(), lopdf::StringFormat::Literal));
+        // Fixed-width dummy values: after saving, the real offsets are patched
+        // into the same character width, so nothing after the array shifts.
+        sig.set(
+            "ByteRange",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(BR_DUMMY),
+                Object::Integer(BR_DUMMY),
+                Object::Integer(BR_DUMMY),
+            ]),
+        );
+        sig.set(
+            "Contents",
+            Object::String(
+                vec![0u8; placeholder_len],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        );
+        field.set("V", Object::Dictionary(sig));
+    }
     field.set("Subtype", Object::Name(b"Widget".to_vec()));
     field.set("F", Object::Integer(132)); // print + locked
     field.set("P", Object::Reference(page_id));
@@ -147,12 +324,17 @@ fn build_field(
     Ok(inc.new_document.add_object(Object::Dictionary(field)))
 }
 
-/// Catalog copy gets `/AcroForm` (or the existing one gains this field).
-fn update_catalog(
+/// Catalog copy gets `/AcroForm` (or the existing one is brought into the
+/// update); the field itself is appended later by `finish_acroform`.
+/// Returns the AcroForm dictionary's object id. `sigflags` adds
+/// `SigFlags 3` (SignaturesExist|AppendOnly) — correct for an embedded
+/// signature, deliberately absent for a stamp-only update whose fields are
+/// just empty placeholders.
+fn prepare_acroform(
     inc: &mut IncrementalDocument,
     catalog_id: ObjectId,
-    field_id: ObjectId,
-) -> Result<(), String> {
+    sigflags: bool,
+) -> Result<ObjectId, String> {
     // What /AcroForm looks like in the catalog copy: indirect, inline, or
     // absent. Read in one short borrow, mutate in the next.
     let existing = {
@@ -167,7 +349,9 @@ fn update_catalog(
                 // Materialize the inline dictionary as its own object so
                 // the new definition wins over the old one.
                 let mut d = d.clone();
-                d.set("SigFlags", Object::Integer(3));
+                if sigflags {
+                    d.set("SigFlags", Object::Integer(3));
+                }
                 if !d.has(b"Fields") {
                     d.set("Fields", Object::Array(vec![]));
                 }
@@ -181,7 +365,9 @@ fn update_catalog(
         Some(id) => id,
         None => {
             let mut acro = Dictionary::new();
-            acro.set("SigFlags", Object::Integer(3));
+            if sigflags {
+                acro.set("SigFlags", Object::Integer(3));
+            }
             acro.set("Fields", Object::Array(vec![]));
             let id = inc.new_document.add_object(Object::Dictionary(acro));
             let new_doc = &mut inc.new_document;
@@ -193,20 +379,30 @@ fn update_catalog(
             id
         }
     };
-    if let Some(id) = existing {
+    if existing.is_some() {
         // The reference case: bring the dictionary into the update so its
         // /Fields can grow.
-        inc.opt_clone_object_to_new_document(id)
+        inc.opt_clone_object_to_new_document(acro_id)
             .map_err(|e| e.to_string())?;
-        let d = inc
-            .new_document
-            .get_object_mut(id)
-            .and_then(Object::as_dict_mut)
-            .map_err(|e| e.to_string())?;
-        d.set("SigFlags", Object::Integer(3));
+        if sigflags {
+            let d = inc
+                .new_document
+                .get_object_mut(acro_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| e.to_string())?;
+            d.set("SigFlags", Object::Integer(3));
+        }
     }
+    Ok(acro_id)
+}
 
-    // Append the field to /Fields (inline array or indirect).
+/// Append the finished field to the AcroForm's `/Fields` (inline array or
+/// indirect).
+fn finish_acroform(
+    inc: &mut IncrementalDocument,
+    acro_id: ObjectId,
+    field_id: ObjectId,
+) -> Result<(), String> {
     let fields_ref = inc
         .new_document
         .get_object_mut(acro_id)
@@ -326,17 +522,12 @@ fn splice_signature(
     key: &PKeyRef<Private>,
     chain: &[X509],
     placeholder_len: usize,
+    profile: crypto::SignatureProfile,
 ) -> Result<(), String> {
     let total = out.len();
     if total as i64 >= BR_DUMMY {
         return Err("PDF is too large to sign".to_string());
     }
-
-    // Locate the ByteRange dummy — fixed-width numbers keep the patch
-    // length-neutral.
-    let br_pattern = format!("/ByteRange[0 {BR_DUMMY} {BR_DUMMY} {BR_DUMMY}]");
-    let br_at = find_unique(out, br_pattern.as_bytes())?;
-    let nums_at = br_at + b"/ByteRange[0 ".len();
 
     // Locate the /Contents hex placeholder: <000...0>.
     let mut ph = vec![b'<'];
@@ -346,19 +537,33 @@ fn splice_signature(
     let s = ph_at + 1;
     let e = s + placeholder_len * 2;
 
-    // [0, s, e, total - e], written space-padded to the dummy width.
-    let width = BR_DUMMY.to_string().len();
-    for (i, v) in [s as i64, e as i64, (total - e) as i64].into_iter().enumerate() {
-        let tok = format!("{v:>width$}");
-        let at = nums_at + i * (width + 1);
-        out[at..at + width].copy_from_slice(tok.as_bytes());
+    // Locate the ByteRange dummy array; the replacement keeps the exact
+    // same byte width (numbers written compactly, the rest padded with
+    // spaces before the closing bracket), so nothing after it shifts.
+    let br_pattern = format!("/ByteRange[0 {BR_DUMMY} {BR_DUMMY} {BR_DUMMY}]");
+    let br_at = find_unique(out, br_pattern.as_bytes())?;
+    let open_at = br_at + b"/ByteRange".len();
+    let close_at = open_at
+        + out[open_at..]
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or("ByteRange array is malformed")?;
+    let total_span = close_at - open_at + 1; // '[' … ']'
+    let compact = format!("[0 {s} {e} {}]", total - e);
+    if compact.len() > total_span {
+        return Err("PDF is too large to sign".to_string());
     }
+    let mut replacement = compact;
+    while replacement.len() < total_span {
+        replacement.insert(replacement.len() - 1, ' ');
+    }
+    out[open_at..=close_at].copy_from_slice(replacement.as_bytes());
 
     // CMS over everything except the placeholder.
     let mut data = Vec::with_capacity(total - placeholder_len * 2);
     data.extend_from_slice(&out[..s]);
     data.extend_from_slice(&out[e..]);
-    let der = crypto::sign_file(cert, key, &data, SignatureKind::Detached, chain)?;
+    let der = crypto::sign_file_ex(cert, key, &data, SignatureKind::Detached, chain, profile)?;
     if der.len() > placeholder_len {
         return Err("Signature does not fit the reserved space".to_string());
     }
@@ -940,6 +1145,171 @@ mod tests {
     }
 
     #[test]
+    fn stamp_only_keeps_document_unsigned() {
+        let (cert, key) = self_signed("Stamp Only");
+        let stamped = stamp_pdf(
+            &fixture_pdf(),
+            cert.as_ref(),
+            Some(&StampOpts {
+                page: 1,
+                x: 40.0,
+                y: 120.0,
+                width: 210.0,
+                signer: "Stamp Only".into(),
+                datetime: "29.09.2026 19:00".into(),
+                organization: String::new(),
+                title: String::new(),
+                fingerprint: "ab".repeat(32),
+            }),
+        )
+        .unwrap();
+        // Incremental over the original, but no signature inside.
+        assert!(stamped.starts_with(&fixture_pdf()));
+        assert!(extract_pdf_signatures(&stamped).is_empty());
+        // The detached CMS over the stamped bytes verifies against them.
+        let der = crypto::sign_file(
+            cert.as_ref(),
+            key.as_ref(),
+            &stamped,
+            crypto::SignatureKind::Detached,
+            &[],
+        )
+        .unwrap();
+        let report = crypto::verify_signature_detailed(&der, Some(&stamped), &[cert]);
+        assert_eq!(report.outcome, VerifyOutcome::Trusted);
+        // A flipped stamp byte must invalidate the detached signature.
+        let mut tampered = stamped.clone();
+        let at = tampered
+            .windows(6)
+            .rposition(|w| w == b"endobj")
+            .expect("objects");
+        tampered[at - 1] ^= 1;
+        let report = crypto::verify_signature_detailed(&der, Some(&tampered), &[]);
+        assert_eq!(report.outcome, VerifyOutcome::Invalid);
+    }
+
+    #[test]
+    fn startxref_points_at_the_update_xref() {
+        // The %PDF update header shifts the update's xref table; the
+        // patched startxref must land exactly on it.
+        let (cert, key) = self_signed("Xref Check");
+        let signed = sign_pdf(&fixture_pdf(), cert.as_ref(), key.as_ref(), &[], None).unwrap();
+        let at = signed.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let mut n = at + 9;
+        while signed[n].is_ascii_whitespace() {
+            n += 1;
+        }
+        let end = n + signed[n..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let sx: usize = std::str::from_utf8(&signed[n..end]).unwrap().parse().unwrap();
+        assert_eq!(&signed[sx..sx + 4], b"xref", "startxref must hit the xref table");
+        // And right past it comes a subsection header ("first count"), not
+        // a fixed layout pinned to lopdf's exact subsection split.
+        let header: Vec<u8> = signed[sx + 4..]
+            .iter()
+            .copied()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .take_while(|b| *b != b'\n' && *b != b'\r')
+            .collect();
+        let header = String::from_utf8_lossy(&header);
+        assert!(
+            header.split_whitespace().count() == 2
+                && header
+                    .split_whitespace()
+                    .all(|t| t.chars().all(|c| c.is_ascii_digit())),
+            "a subsection header must follow the xref keyword, got {header:?}"
+        );
+    }
+
+    #[test]
+    fn generated_id_elements_differ() {
+        // The fixture's trailer has no /ID, so the update generates one;
+        // per PDF 32000-1 14.4 the two elements must not be equal.
+        let (cert, key) = self_signed("ID Check");
+        let signed = sign_pdf(&fixture_pdf(), cert.as_ref(), key.as_ref(), &[], None).unwrap();
+        let at = signed
+            .windows(7)
+            .rposition(|w| w == b"trailer")
+            .unwrap();
+        let seg = &signed[at..];
+        let open = seg.windows(4).position(|w| w == b"/ID[").unwrap();
+        let close = seg[open..]
+            .iter()
+            .position(|&b| b == b']')
+            .unwrap()
+            + open;
+        let body = String::from_utf8_lossy(&seg[open + 4..close]).to_string();
+        let ids: Vec<&str> = body.split("><").collect();
+        assert_eq!(ids.len(), 2, "two /ID elements: {body}");
+        assert_ne!(ids[0], ids[1], "the elements must differ");
+    }
+
+    #[test]
+    fn signs_a_source_without_trailing_newline() {
+        // lopdf appends its own separator newline for such originals; the
+        // %PDF update header must still land after the last original byte
+        // and startxref must keep pointing at the xref table.
+        let (cert, key) = self_signed("No Newline");
+        let mut pdf = fixture_pdf();
+        while pdf.last() == Some(&b'\n') || pdf.last() == Some(&b'\r') {
+            pdf.pop();
+        }
+        assert_ne!(pdf.last(), Some(&b'\n'));
+        let signed = sign_pdf(&pdf, cert.as_ref(), key.as_ref(), &[], None).unwrap();
+        assert!(signed.starts_with(&pdf));
+        // startxref resolves onto the xref table (poppler recovery check).
+        let at = signed.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let mut n = at + 9;
+        while signed[n].is_ascii_whitespace() {
+            n += 1;
+        }
+        let end = n + signed[n..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let sx: usize = std::str::from_utf8(&signed[n..end]).unwrap().parse().unwrap();
+        assert_eq!(&signed[sx..sx + 4], b"xref");
+        // And the whole document is still signed.
+        let sigs = extract_pdf_signatures(&signed);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].trailing, 0);
+    }
+
+    #[test]
+    fn cades_profile_toggles_the_attribute() {
+        let (cert, key) = self_signed("Profile Check");
+        // The signing-certificate-v2 OID content: 1.2.840.113549.1.9.16.2.47
+        let scv2: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F];
+        let cades = crypto::sign_file_ex(
+            cert.as_ref(),
+            key.as_ref(),
+            b"data",
+            crypto::SignatureKind::Detached,
+            &[],
+            crypto::SignatureProfile::CadesBes,
+        )
+        .unwrap();
+        assert!(cades.windows(scv2.len()).any(|w| w == scv2), "CAdES carries sc-v2");
+        assert_eq!(
+            crypto::verify_signature_detailed(&cades, Some(b"data"), &[cert.clone()]).outcome,
+            VerifyOutcome::Trusted
+        );
+        let pkcs7 = crypto::sign_file_ex(
+            cert.as_ref(),
+            key.as_ref(),
+            b"data",
+            crypto::SignatureKind::Detached,
+            &[],
+            crypto::SignatureProfile::Pkcs7,
+        )
+        .unwrap();
+        assert!(
+            !pkcs7.windows(scv2.len()).any(|w| w == scv2),
+            "PKCS#7 profile has no sc-v2"
+        );
+        assert_eq!(
+            crypto::verify_signature_detailed(&pkcs7, Some(b"data"), &[cert]).outcome,
+            VerifyOutcome::Trusted
+        );
+    }
+
+    #[test]
     fn sign_extract_verify_roundtrip() {
         let (cert, key) = self_signed("PDF Signer");
         let signed = sign_pdf(&fixture_pdf(), cert.as_ref(), key.as_ref(), &[], None).unwrap();
@@ -1153,6 +1523,143 @@ mod tests {
 mod manual {
     use super::tests::{fixture_pdf, self_signed};
     use super::*;
+
+    /// Writes /tmp/xca-signed-twice.pdf — the same document signed by two
+    /// GOST keys (the first signature then has trailing bytes). Run with
+    /// `cargo test -- --ignored dump_twice`.
+    #[test]
+    #[ignore]
+    fn dump_twice() {
+        let (cert1, key1) = crate::cpcsp::tests::test_gost_key_pub();
+        let (cert2, key2) = crate::cpcsp::tests::test_gost_key_pub();
+        let stamp = StampOpts {
+            page: 1,
+            x: 40.0,
+            y: 120.0,
+            width: 210.0,
+            signer: "First Signer".into(),
+            datetime: "29.09.2026 18:00".into(),
+            organization: String::new(),
+            title: String::new(),
+            fingerprint: "ab".repeat(32),
+        };
+        let once = sign_pdf(&fixture_pdf(), cert1.as_ref(), key1.as_ref(), &[], Some(&stamp)).unwrap();
+        let stamp2 = StampOpts { signer: "Second Signer".into(), x: 40.0, y: 400.0, ..stamp };
+        let twice = sign_pdf(&once, cert2.as_ref(), key2.as_ref(), &[], Some(&stamp2)).unwrap();
+        std::fs::write("/tmp/xca-signed-twice.pdf", twice).unwrap();
+        eprintln!("written /tmp/xca-signed-twice.pdf");
+    }
+
+    /// Signs the fixture (or XCA_TEST_PDF) with a real CryptoPro CSP 5 PFX
+    /// (passwordless) — /tmp/xca-trusted-signed.pdf, for the CryptoPro SVS
+    /// check loop. The PFX comes from XCA_TEST_PFX only: no personal
+    /// defaults in the repo. Skipped when the variable is unset.
+    #[test]
+    #[ignore]
+    fn dump_trusted_pfx() {
+        let Ok(pfx) = std::env::var("XCA_TEST_PFX") else {
+            eprintln!("skipping: XCA_TEST_PFX is not set");
+            return;
+        };
+        let data = std::fs::read(&pfx).unwrap_or_else(|e| panic!("{pfx}: {e}"));
+        let g = crate::cpcsp::parse_gost_pfx(&data, "").expect("parse");
+        let key = g.key.expect("key");
+        let cert = g.certs.into_iter().next().expect("cert");
+        let src = std::env::var("XCA_TEST_PDF").ok();
+        let pdf = src
+            .map(|p| std::fs::read(p).expect("XCA_TEST_PDF read"))
+            .unwrap_or_else(fixture_pdf);
+        let stamp = if std::env::var("XCA_TEST_INVISIBLE").is_ok() {
+            None
+        } else {
+            Some(StampOpts {
+                page: 1,
+                x: 40.0,
+                y: 120.0,
+                width: 210.0,
+                signer: "Trusted Test Signer".into(),
+                datetime: "30.09.2026 10:00".into(),
+                organization: String::new(),
+                title: String::new(),
+                fingerprint: "ab".repeat(32),
+            })
+        };
+        let signed = match sign_pdf(&pdf, cert.as_ref(), key.as_ref(), &[], stamp.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SIGN FAILED: {e}");
+                panic!("{e}");
+            }
+        };
+        std::fs::write("/tmp/xca-trusted-signed.pdf", signed).unwrap();
+        eprintln!("written /tmp/xca-trusted-signed.pdf");
+    }
+
+    /// Writes /tmp/xca-stamp-only.pdf — the source (or fixture) with the
+    /// visible stamp but no embedded signature (the detached flow's PDF).
+    /// XCA_TEST_PDF overrides the source document.
+    #[test]
+    #[ignore]
+    fn dump_stamp_only() {
+        let (cert, _key) = crate::cpcsp::tests::test_gost_key_pub();
+        let src = std::env::var("XCA_TEST_PDF")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::Path::new("/tmp/fixture-src.pdf").to_path_buf());
+        let pdf = std::fs::read(&src).unwrap_or_else(|_| fixture_pdf());
+        let stamped = stamp_pdf(
+            &pdf,
+            cert.as_ref(),
+            Some(&StampOpts {
+                page: 1,
+                x: 40.0,
+                y: 120.0,
+                width: 210.0,
+                signer: "Stamp Only Render".into(),
+                datetime: "30.09.2026 10:00".into(),
+                organization: String::new(),
+                title: String::new(),
+                fingerprint: "ab".repeat(32),
+            }),
+        )
+        .unwrap();
+        std::fs::write("/tmp/xca-stamp-only.pdf", stamped).unwrap();
+        eprintln!("written /tmp/xca-stamp-only.pdf");
+    }
+
+    /// Writes /tmp/xca-signed-gost.pdf (GOST key, visible stamp) — run with
+    /// `cargo test -- --ignored dump_gost` and check on the CryptoPro SVS.
+    /// XCA_TEST_PDF overrides the source document.
+    #[test]
+    #[ignore]
+    fn dump_gost() {
+        let (cert, key) = crate::cpcsp::tests::test_gost_key_pub();
+        let src = std::env::var("XCA_TEST_PDF")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new("/tmp/fixture-src.pdf").to_path_buf()
+            });
+        let pdf = std::fs::read(&src).unwrap_or_else(|_| fixture_pdf());
+        let signed = sign_pdf(
+            &pdf,
+            cert.as_ref(),
+            key.as_ref(),
+            &[],
+            Some(&StampOpts {
+                page: 1,
+                x: 40.0,
+                y: 120.0,
+                width: 210.0,
+                signer: "GOST Signer".into(),
+                datetime: "29.09.2026 17:40".into(),
+                organization: String::new(),
+                title: String::new(),
+                fingerprint: "ab".repeat(32),
+            }),
+        )
+        .unwrap();
+        std::fs::write("/tmp/xca-signed-gost.pdf", signed).unwrap();
+        eprintln!("written /tmp/xca-signed-gost.pdf from {}", src.display());
+    }
 
     /// Writes /tmp/xca-signed-sample.pdf — run with
     /// `cargo test -- --ignored dump_sample` and inspect with `pdfsig`.
