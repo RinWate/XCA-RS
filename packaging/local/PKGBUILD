@@ -1,0 +1,74 @@
+# Maintainer: Denis "RinWate" Egorov <rinwate@yandex.ru>
+# LOCAL-ONLY PKGBUILD: never publish this to the AUR.
+#
+# Builds a package straight from the working tree, fully offline:
+#  - no GitHub tarball — compiles the sources in place (../..);
+#  - no crates.io — the cargo cache is seeded from ~/.cargo/registry
+#    (only the 48 MB of .crate archives; the extracted src/ is not
+#    needed, cargo unpacks from cache itself).
+#
+# Usage:
+#   cd packaging/local && makepkg -sr        # + tests (~1 min, --nocheck to skip)
+#   pacman -U xca-rs-local-*.pkg.tar.zst
+#
+# Prerequisite on a fresh machine: run `cargo fetch --locked` once in the
+# repo so ~/.cargo holds the crates of the current Cargo.lock.
+#
+# Update pkgver below when bumping Cargo.toml.
+
+pkgname=xca-rs
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="XCA rewritten in Rust with GTK4 + GOST — local build from the working tree"
+arch=('x86_64')
+url="https://github.com/RinWate/xca-rs"
+license=('GPL-2.0-or-later')
+depends=('gtk4' 'libadwaita' 'openssl' 'openssl-gost-engine' 'glib2' 'glibc' 'poppler')
+makedepends=('rust' 'gcc' 'pkgconf')
+conflicts=('xca-rs-bin')
+options=(!lto)
+
+_repo="$startdir/../.."
+
+# Same hermetic setup as the AUR source package: a fresh CARGO_HOME (so the
+# builder's ~/.cargo/config.toml never leaks in), no stray flags, and the
+# host linker pinned via --config (outranks env and config files).
+_hermetic_cargo() {
+    export CARGO_HOME="$srcdir/cargo-home"
+    unset CFLAGS CXXFLAGS LDFLAGS
+    unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+    unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
+}
+
+_pin_linker=(--config 'target.x86_64-unknown-linux-gnu.linker="cc"')
+
+prepare() {
+    _hermetic_cargo
+    # Seed the offline cache from the user's cargo home: the sparse-index
+    # metadata (~12 MB) + the .crate archives (~50 MB) — cargo needs both
+    # to resolve from the lockfile without touching the network; the
+    # extracted src/ is not needed, cargo unpacks from cache itself.
+    mkdir -p "$CARGO_HOME/registry"
+    cp -a "$HOME/.cargo/registry/index" "$CARGO_HOME/registry/index"
+    cp -a "$HOME/.cargo/registry/cache" "$CARGO_HOME/registry/cache"
+}
+
+build() {
+    _hermetic_cargo
+    cd "$_repo"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --frozen --release "${_pin_linker[@]}"
+}
+
+check() {
+    _hermetic_cargo
+    cd "$_repo"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo test --frozen --release "${_pin_linker[@]}"
+}
+
+package() {
+    install -Dm755 "$srcdir/target/release/xca-rs" -t "$pkgdir/usr/bin"
+    install -Dm644 "$_repo/packaging/org.xca.rs.desktop" -t "$pkgdir/usr/share/applications"
+    install -Dm644 "$_repo/packaging/org.xca.rs.svg" -t "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+}
