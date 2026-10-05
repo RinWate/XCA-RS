@@ -16,6 +16,7 @@ pub mod password;
 pub mod pdf_place;
 pub mod san;
 pub mod sign;
+pub mod ssh;
 pub mod token;
 
 pub fn error_dialog(parent: &adw::ApplicationWindow, msg: &str) {

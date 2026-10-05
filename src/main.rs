@@ -7,8 +7,11 @@ mod cpcsp;
 mod crypto;
 mod db;
 mod launch;
+mod notify;
 mod pdf_sign;
 mod pkcs11;
+mod ssh;
+mod sshconf;
 mod ui;
 mod xca_format;
 

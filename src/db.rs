@@ -95,6 +95,40 @@ pub struct CrlRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct SshKeyRecord {
+    pub id: i64,
+    pub name: String,
+    /// SSH algorithm name, e.g. "ssh-ed25519"; part of the record API
+    /// (read by the storage tests).
+    #[allow(dead_code)]
+    pub algo: String,
+    pub is_ca: bool,
+    /// False when only the public part is stored (`.pub` import).
+    pub has_private: bool,
+    pub comment: String,
+    /// The public-key blob, including the algorithm name.
+    pub public: Vec<u8>,
+}
+
+impl SshKeyRecord {
+    /// "Ed25519", "RSA 3072", "ECDSA nistp384" — for list columns.
+    pub fn type_label(&self) -> String {
+        crate::ssh::describe_blob(&self.public)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SshCertRecord {
+    pub id: i64,
+    pub name: String,
+    /// The signing CA key (`items.id`), when it is in the database.
+    pub ca_key: Option<i64>,
+    /// The certified key (`items.id`), when it is in the database.
+    pub key_item: Option<i64>,
+    pub cert: crate::ssh::SshCert,
+}
+
+#[derive(Clone, Debug)]
 pub struct RevokedRecord {
     pub ca_id: i64,
     pub serial: String,
@@ -309,9 +343,36 @@ impl Db {
                 .map_err(s)?;
             updates.push((item, xf::b64_encode(&enc)));
         }
+        // SSH keys: their openssh-key-v1 containers are encrypted with the
+        // database password too, so they follow the same re-encryption.
+        let mut ssh_updates = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT item, private FROM ssh_keys WHERE private IS NOT NULL")
+                .map_err(s)?;
+            let ssh_rows: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(s)?
+                .collect::<Result<_, _>>()
+                .map_err(s)?;
+            drop(stmt);
+            for (item, pem) in ssh_rows {
+                let parsed =
+                    crate::ssh::parse_private_pem(pem.as_bytes(), &self.password).map_err(s)?;
+                let enc =
+                    crate::ssh::encode_private_pem(&parsed.pkey, &parsed.comment, new_password)
+                        .map_err(s)?;
+                ssh_updates.push((item, String::from_utf8_lossy(&enc).into_owned()));
+            }
+        }
         let tx = self.conn.transaction().map_err(s)?;
         for (item, b64) in updates {
             tx.execute("UPDATE private_keys SET private=?1 WHERE item=?2", params![b64, item])
+                .map_err(s)?;
+        }
+        for (item, pem) in ssh_updates {
+            tx.execute("UPDATE ssh_keys SET private=?1 WHERE item=?2", params![pem, item])
                 .map_err(s)?;
         }
         if new_password.is_empty() {
@@ -898,6 +959,242 @@ impl Db {
             self.conn.execute(sql, params![id]).map_err(s)?;
         }
         Ok(())
+    }
+
+    // ---- SSH keys and certificates ----
+
+    /// Store an SSH key: the public blob in the clear, the private part
+    /// as an openssh-key-v1 PEM encrypted with the database password
+    /// (unencrypted when the database has none).
+    pub fn insert_ssh_key(
+        &self,
+        name: &str,
+        is_ca: bool,
+        key: &openssl::pkey::PKeyRef<openssl::pkey::Private>,
+        comment: &str,
+    ) -> Result<i64, String> {
+        let blob = crate::ssh::pubkey_blob(key).map_err(s)?;
+        let pem = crate::ssh::encode_private_pem(key, comment, &self.password).map_err(s)?;
+        let id = self.insert_item(name, xf::T_SSH_KEY, xf::SRC_GENERATED)?;
+        self.conn
+            .execute(
+                "INSERT INTO ssh_keys(item, algo, is_ca, comment, \"public\", private)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    crate::ssh::SshAlgo::of_blob(&blob).map_err(s)?.name(),
+                    is_ca as i64,
+                    comment,
+                    xf::b64_encode(&blob),
+                    String::from_utf8_lossy(&pem).into_owned(),
+                ],
+            )
+            .map_err(s)?;
+        Ok(id)
+    }
+
+    /// Store a public-only SSH key (imported from a `.pub` line).
+    pub fn insert_ssh_public_key(
+        &self,
+        name: &str,
+        blob: &[u8],
+        comment: &str,
+    ) -> Result<i64, String> {
+        let algo = crate::ssh::SshAlgo::of_blob(blob).map_err(s)?;
+        let id = self.insert_item(name, xf::T_SSH_KEY, xf::SRC_IMPORTED)?;
+        self.conn
+            .execute(
+                "INSERT INTO ssh_keys(item, algo, is_ca, comment, \"public\", private)
+                 VALUES (?1, ?2, 0, ?3, ?4, NULL)",
+                params![id, algo.name(), comment, xf::b64_encode(blob)],
+            )
+            .map_err(s)?;
+        Ok(id)
+    }
+
+    fn ssh_key_query<P: rusqlite::Params>(
+        &self,
+        tail: &str,
+        p: P,
+    ) -> Result<Vec<SshKeyRecord>, String> {
+        let sql = format!(
+            "SELECT i.id, i.name, k.algo, k.is_ca, k.comment, k.\"public\",
+                    k.private IS NOT NULL
+             FROM items i
+             JOIN ssh_keys k ON k.item = i.id
+             WHERE i.type = {TY} AND i.del = 0 {tail}",
+            TY = xf::T_SSH_KEY,
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(s)?;
+        let rows = stmt
+            .query_map(p, |r| {
+                Ok(SshKeyRecord {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    algo: r.get(2)?,
+                    is_ca: r.get::<_, i64>(3)? != 0,
+                    comment: r.get(4)?,
+                    public: xf::b64_decode(&r.get::<_, String>(5)?).unwrap_or_default(),
+                    has_private: r.get(6)?,
+                })
+            })
+            .map_err(s)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(s)
+    }
+
+    pub fn list_ssh_keys(&self) -> Result<Vec<SshKeyRecord>, String> {
+        self.ssh_key_query("ORDER BY i.name, i.id", [])
+    }
+
+    pub fn get_ssh_key(&self, id: i64) -> Result<Option<SshKeyRecord>, String> {
+        Ok(self.ssh_key_query("AND i.id = ?1", params![id])?.into_iter().next())
+    }
+
+    /// The decrypted private key of a stored SSH key, None for
+    /// public-only entries.
+    pub fn ssh_key_private(
+        &self,
+        id: i64,
+    ) -> Result<Option<openssl::pkey::PKey<openssl::pkey::Private>>, String> {
+        let pem: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT private FROM ssh_keys WHERE item = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(s)?;
+        let Some(pem) = pem else { return Ok(None) };
+        Ok(Some(
+            crate::ssh::parse_private_pem(pem.as_bytes(), &self.password)
+                .map_err(s)?
+                .pkey,
+        ))
+    }
+
+    /// Update the CA flag of a stored SSH key (making a key a CA or
+    /// retiring it back to a plain key).
+    pub fn delete_ssh_key(&self, id: i64) -> Result<(), String> {
+        for sql in [
+            "DELETE FROM ssh_keys WHERE item=?1",
+            "UPDATE ssh_certs SET ca_key=NULL WHERE ca_key=?1",
+            "UPDATE ssh_certs SET key_item=NULL WHERE key_item=?1",
+            "DELETE FROM items WHERE id=?1",
+        ] {
+            self.conn.execute(sql, params![id]).map_err(s)?;
+        }
+        Ok(())
+    }
+
+    pub fn ssh_key_exists(&self, blob: &[u8]) -> Result<bool, String> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ssh_keys WHERE \"public\" = ?1",
+            params![xf::b64_encode(blob)],
+            |r| r.get(0),
+        ).map_err(s)?;
+        Ok(n > 0)
+    }
+
+    pub fn insert_ssh_cert(
+        &self,
+        name: &str,
+        cert: &crate::ssh::SshCert,
+        ca_key: Option<i64>,
+        key_item: Option<i64>,
+        imported: bool,
+    ) -> Result<i64, String> {
+        let id = self.insert_item(
+            name,
+            xf::T_SSH_CERT,
+            if imported { xf::SRC_IMPORTED } else { xf::SRC_GENERATED },
+        )?;
+        self.conn
+            .execute(
+                "INSERT INTO ssh_certs(item, ca_key, key_item, cert) VALUES (?1, ?2, ?3, ?4)",
+                params![id, ca_key, key_item, xf::b64_encode(&cert.blob)],
+            )
+            .map_err(s)?;
+        Ok(id)
+    }
+
+    fn ssh_cert_query<P: rusqlite::Params>(
+        &self,
+        tail: &str,
+        p: P,
+    ) -> Result<Vec<SshCertRecord>, String> {
+        let sql = format!(
+            "SELECT i.id, i.name, c.ca_key, c.key_item, c.cert
+             FROM items i
+             JOIN ssh_certs c ON c.item = i.id
+             WHERE i.type = {TY} AND i.del = 0 {tail}",
+            TY = xf::T_SSH_CERT,
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(s)?;
+        let rows = stmt
+            .query_map(p, |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(s)?;
+        let mut out = Vec::new();
+        for row in rows.collect::<Result<Vec<_>, _>>().map_err(s)? {
+            let (id, name, ca_key, key_item, cert_b64) = row;
+            let Some(blob) = xf::b64_decode(&cert_b64) else { continue };
+            let Ok(cert) = crate::ssh::parse_cert(&blob) else { continue };
+            out.push(SshCertRecord {
+                id,
+                name,
+                ca_key,
+                key_item,
+                cert,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_ssh_certs(&self) -> Result<Vec<SshCertRecord>, String> {
+        self.ssh_cert_query("ORDER BY i.name, i.id", [])
+    }
+
+    pub fn get_ssh_cert(&self, id: i64) -> Result<Option<SshCertRecord>, String> {
+        Ok(self.ssh_cert_query("AND i.id = ?1", params![id])?.into_iter().next())
+    }
+
+    pub fn delete_ssh_cert(&self, id: i64) -> Result<(), String> {
+        for sql in [
+            "DELETE FROM ssh_certs WHERE item=?1",
+            "DELETE FROM items WHERE id=?1",
+        ] {
+            self.conn.execute(sql, params![id]).map_err(s)?;
+        }
+        Ok(())
+    }
+
+    pub fn ssh_cert_exists(&self, blob: &[u8]) -> Result<bool, String> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ssh_certs WHERE cert = ?1",
+            params![xf::b64_encode(blob)],
+            |r| r.get(0),
+        ).map_err(s)?;
+        Ok(n > 0)
+    }
+
+    /// The next certificate serial for an SSH CA — a per-CA counter in
+    /// the settings table, like the original XCA keeps crlNo per CA.
+    pub fn next_ssh_serial(&self, ca_id: i64) -> Result<u64, String> {
+        let key = format!("ssh-serial-{ca_id}");
+        let n: i64 = self
+            .get_setting(&key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+            + 1;
+        self.set_setting(&key, &n.to_string())?;
+        Ok(n as u64)
     }
 
     // ---- revocation ----
@@ -1516,6 +1813,8 @@ mod tests {
             "takeys",
             "authority",
             "token_mechanism",
+            "ssh_keys",
+            "ssh_certs",
         ] {
             assert!(table_exists(&conn, table).unwrap(), "missing table {table}");
         }
@@ -1719,6 +2018,111 @@ mod tests {
         }
         let db = Db::open(&path, None).unwrap();
         assert_eq!(db.list_keys().unwrap()[0].name, "new name");
+    }
+
+    #[test]
+    fn ssh_keys_and_certs_crud() {
+        let db = Db::open(&tmpdir("ssh").join("s.xdb"), None).unwrap();
+        let ca = crate::ssh::NewSshKind::Ed25519.generate().unwrap();
+        let ca_blob = crate::ssh::pubkey_blob(&ca).unwrap();
+        let ca_id = db
+            .insert_ssh_key("ssh ca", true, &ca, "root comment")
+            .unwrap();
+
+        let keys = db.list_ssh_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "ssh ca");
+        assert_eq!(keys[0].algo, "ssh-ed25519");
+        assert!(keys[0].is_ca && keys[0].has_private);
+        assert_eq!(keys[0].public, ca_blob);
+        assert_eq!(keys[0].type_label(), "Ed25519");
+
+        // The stored private part decrypts back to the same key.
+        let priv1 = db.ssh_key_private(ca_id).unwrap().unwrap();
+        assert_eq!(crate::ssh::pubkey_blob(&priv1).unwrap(), ca_blob);
+        assert!(db.ssh_key_exists(&ca_blob).unwrap());
+
+        // Public-only import: no private part, flagged as such.
+        let user = crate::ssh::NewSshKind::EcdsaP256.generate().unwrap();
+        let user_blob = crate::ssh::pubkey_blob(&user).unwrap();
+        let uid = db
+            .insert_ssh_public_key("user pub", &user_blob, "user@host")
+            .unwrap();
+        assert!(!db.get_ssh_key(uid).unwrap().unwrap().has_private);
+        assert!(db.ssh_key_private(uid).unwrap().is_none());
+
+        // Certificate with CA and subject links, per-CA serial counter.
+        let cert = crate::ssh::build_cert(
+            &user_blob,
+            &ca,
+            &crate::ssh::SshCertParams {
+                serial: db.next_ssh_serial(ca_id).unwrap(),
+                cert_type: crate::ssh::SshCertType::User,
+                key_id: "k".into(),
+                principals: vec!["p".into()],
+                valid_after: 0,
+                valid_before: crate::ssh::FOREVER,
+                critical: Vec::new(),
+                extensions: vec!["permit-pty".into()],
+            },
+        )
+        .unwrap();
+        let cid = db
+            .insert_ssh_cert("my cert", &cert, Some(ca_id), Some(uid), false)
+            .unwrap();
+        let certs = db.list_ssh_certs().unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].cert.key_id, "k");
+        assert_eq!(certs[0].cert.valid_before, crate::ssh::FOREVER);
+        assert_eq!(certs[0].ca_key, Some(ca_id));
+        assert_eq!(certs[0].key_item, Some(uid));
+        assert_eq!(db.next_ssh_serial(ca_id).unwrap(), 2);
+        assert!(db.ssh_cert_exists(&cert.blob).unwrap());
+
+        // Deleting the CA nulls the reference; the cert stays.
+        db.delete_ssh_key(ca_id).unwrap();
+        assert_eq!(db.list_ssh_certs().unwrap()[0].ca_key, None);
+        db.delete_ssh_cert(cid).unwrap();
+        assert!(db.list_ssh_certs().unwrap().is_empty());
+    }
+
+    /// SSH private keys are encrypted with the database password exactly
+    /// like X.509 keys and follow it through change_password.
+    #[test]
+    fn ssh_private_keys_follow_database_password() {
+        let dir = tmpdir("sshpw");
+        let path = dir.join("s.xdb");
+        let key = crate::ssh::NewSshKind::Rsa2048.generate().unwrap();
+        let blob = crate::ssh::pubkey_blob(&key).unwrap();
+        let id = {
+            let db = Db::open(&path, Some("one")).unwrap();
+            db.insert_ssh_key("k", false, &key, "c").unwrap()
+        };
+        // At rest the container is really encrypted.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let pem: String = conn
+                .query_row("SELECT private FROM ssh_keys", [], |r| r.get(0))
+                .unwrap();
+            assert!(crate::ssh::pem_needs_password(pem.as_bytes()));
+            assert!(crate::ssh::parse_private_pem(pem.as_bytes(), "wrong").is_err());
+        }
+        let mut db = Db::open(&path, Some("one")).unwrap();
+        assert_eq!(
+            crate::ssh::pubkey_blob(&db.ssh_key_private(id).unwrap().unwrap()).unwrap(),
+            blob
+        );
+        db.change_password("two").unwrap();
+        assert_eq!(
+            crate::ssh::pubkey_blob(&db.ssh_key_private(id).unwrap().unwrap()).unwrap(),
+            blob
+        );
+        drop(db);
+        let db = Db::open(&path, Some("two")).unwrap();
+        assert_eq!(
+            crate::ssh::pubkey_blob(&db.ssh_key_private(id).unwrap().unwrap()).unwrap(),
+            blob
+        );
     }
 
     /// Manual check against a real original-XCA database:

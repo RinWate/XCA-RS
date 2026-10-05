@@ -1929,6 +1929,10 @@ pub fn probably_needs_password(data: &[u8]) -> bool {
     if text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
         return true;
     }
+    // openssh-key-v1 containers only need one when a KDF is inside.
+    if text.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+        return crate::ssh::pem_needs_password(data);
+    }
     if looks_like_der(data) {
         let is_cert = X509::from_der(data).is_ok();
         let is_req = X509Req::from_der(data).is_ok();
@@ -1966,7 +1970,9 @@ pub fn parse_any(data: &[u8], password: Option<&str>) -> CryptoResult<Vec<Import
             Err(e) => return Err(format!("PEM request parse error: {e}")),
         }
     }
-    if text.contains("PRIVATE KEY-----") {
+    // OPENSSH containers would match the generic PEM probe below and fail;
+    // the SSH import path handles them.
+    if text.contains("PRIVATE KEY-----") && !text.contains("OPENSSH PRIVATE KEY") {
         let key = PKey::private_key_from_pem_callback(data, import_password_cb(password))
             .map_err(|e| format!("Private key parse error: {e} (wrong password?)"))?;
         out.push(Imported::Key { key });

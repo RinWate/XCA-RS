@@ -28,7 +28,9 @@ pub fn open(app: &App) {
                 match file.load_contents(None::<&gtk::gio::Cancellable>) {
                     Ok((data, _)) => {
                         let data = data.to_vec();
-                        if crypto::probably_needs_password(&data) {
+                        if crypto::probably_needs_password(&data)
+                            || crate::ssh::pem_needs_password(&data)
+                        {
                             ask_password(&app2, data);
                         } else {
                             do_import(&app2, data, None);
@@ -164,6 +166,9 @@ fn do_import_container(app: &App, path: &std::path::Path, password: &str) {
 }
 
 pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {
+    if crate::ssh::looks_like_ssh(&data) {
+        return do_import_ssh(app, &data, password);
+    }
     let items = match crypto::parse_any(&data, password) {
         Ok(items) => items,
         Err(e) => return error_dialog(&app.window, &e),
@@ -303,6 +308,123 @@ pub fn do_import(app: &App, data: Vec<u8>, password: Option<&str>) {
     }
     if n_reqs > 0 {
         parts.push(tr!("%{count} requests", count = n_reqs as i64));
+    }
+    if parts.is_empty() {
+        if n_dup > 0 {
+            app.toast(&tr!("Nothing imported — all items already exist"));
+        } else {
+            app.toast(&tr!("Nothing to import"));
+        }
+    } else {
+        let dup = if n_dup > 0 {
+            format!(" ({})", tr!("%{count} duplicates skipped", count = n_dup as i64))
+        } else {
+            String::new()
+        };
+        app.toast(&format!("{}{dup}", tr!("Imported: %{list}", list = parts.join(", "))));
+    }
+}
+
+/// SSH import: openssh-key-v1 private keys, public-key lines and
+/// certificate lines (also several per file, authorized_keys-style).
+/// Certificates link to their CA and subject keys when those are in the
+/// database.
+pub fn do_import_ssh(app: &App, data: &[u8], password: Option<&str>) {
+    let text = String::from_utf8_lossy(data);
+    let mut n_keys = 0usize;
+    let mut n_certs = 0usize;
+    let mut n_dup = 0usize;
+    let mut error: Option<String> = None;
+
+    {
+        let db = app.db.lock().unwrap();
+
+        if text.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+            match crate::ssh::parse_private_pem(data, password.unwrap_or("")) {
+                Ok(k) => {
+                    if db.ssh_key_exists(&k.public_blob).unwrap_or(false) {
+                        n_dup += 1;
+                    } else {
+                        let label = if k.comment.is_empty() {
+                            format!(
+                                "Imported SSH {}",
+                                crate::ssh::describe_blob(&k.public_blob)
+                            )
+                        } else {
+                            k.comment.clone()
+                        };
+                        if db
+                            .insert_ssh_key(&label, false, &k.pkey, &k.comment)
+                            .is_ok()
+                        {
+                            n_keys += 1;
+                        }
+                    }
+                }
+                Err(e) => error = Some(e),
+            }
+        }
+
+        // Snapshot after the private import: certificate lines in the same
+        // file link against keys that may just have landed.
+        let keys = db.list_ssh_keys().unwrap_or_default();
+
+        if error.is_none() {
+            for line in text.lines() {
+                if let Some((blob, comment)) = crate::ssh::parse_public_line(line) {
+                    if db.ssh_key_exists(&blob).unwrap_or(false) {
+                        n_dup += 1;
+                        continue;
+                    }
+                    let label = if comment.is_empty() {
+                        format!("Imported SSH {}", crate::ssh::describe_blob(&blob))
+                    } else {
+                        comment.clone()
+                    };
+                    if db.insert_ssh_public_key(&label, &blob, &comment).is_ok() {
+                        n_keys += 1;
+                    }
+                    continue;
+                }
+                if let Some((cert, comment)) = crate::ssh::parse_cert_line(line) {
+                    if db.ssh_cert_exists(&cert.blob).unwrap_or(false) {
+                        n_dup += 1;
+                        continue;
+                    }
+                    // Link to the CA and subject keys by their blobs.
+                    let ca_key = keys
+                        .iter()
+                        .find(|k| k.is_ca && k.public == cert.ca_blob)
+                        .map(|k| k.id);
+                    let key_item = keys
+                        .iter()
+                        .find(|k| k.public == cert.public_blob)
+                        .map(|k| k.id);
+                    let name = if !cert.key_id.is_empty() {
+                        cert.key_id.clone()
+                    } else if !comment.is_empty() {
+                        comment.clone()
+                    } else {
+                        "SSH certificate".to_string()
+                    };
+                    if db.insert_ssh_cert(&name, &cert, ca_key, key_item, true).is_ok() {
+                        n_certs += 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(e) = error {
+        return error_dialog(&app.window, &e);
+    }
+
+    app.refresh();
+    let mut parts = Vec::new();
+    if n_keys > 0 {
+        parts.push(tr!("%{count} SSH keys", count = n_keys as i64));
+    }
+    if n_certs > 0 {
+        parts.push(tr!("%{count} SSH certificates", count = n_certs as i64));
     }
     if parts.is_empty() {
         if n_dup > 0 {

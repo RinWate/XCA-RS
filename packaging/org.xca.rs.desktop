@@ -10,4 +10,4 @@ Icon=org.xca.rs
 Terminal=false
 Categories=Utility;Security;FileTools;
 StartupWMClass=org.xca.rs
-Keywords=certificate;key;pki;x509;ca;csr;crl;pkcs11;
+Keywords=certificate;key;pki;x509;ca;csr;crl;pkcs11;ssh;

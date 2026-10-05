@@ -24,10 +24,30 @@ pub struct Pages {
     pub certs_children: crate::ui::columns::ChildrenMap,
     pub reqs: gtk::gio::ListStore,
     pub crls: gtk::gio::ListStore,
+    pub ssh_keys: gtk::gio::ListStore,
+    pub ssh_certs: gtk::gio::ListStore,
+    /// The Keys / Certificates split inside the SSH section.
+    pub ssh_stack: adw::ViewStack,
+    /// True when the keys list reads the user's ~/.ssh instead of the
+    /// database.
+    pub ssh_from_storage: std::cell::Cell<bool>,
+    /// ~/.ssh scan results, index-aligned with the keys list rows in
+    /// storage mode.
+    pub ssh_user_keys: std::cell::RefCell<Vec<crate::ssh::UserKey>>,
+    /// The same for the certificates list.
+    pub ssh_certs_from_storage: std::cell::Cell<bool>,
+    pub ssh_user_certs: std::cell::RefCell<Vec<crate::ssh::UserCert>>,
+    /// The parsed ~/.ssh/config and the Host rows' block indexes.
+    pub ssh_config: std::cell::RefCell<crate::sshconf::SshConfig>,
+    pub ssh_host_ids: std::cell::RefCell<Vec<usize>>,
+    pub hosts: gtk::gio::ListStore,
+    pub hosts_sel: gtk::SingleSelection,
     pub keys_sel: gtk::SingleSelection,
     pub certs_sel: gtk::SingleSelection,
     pub reqs_sel: gtk::SingleSelection,
     pub crls_sel: gtk::SingleSelection,
+    pub ssh_keys_sel: gtk::SingleSelection,
+    pub ssh_certs_sel: gtk::SingleSelection,
 }
 
 fn page(view: &gtk::ColumnView) -> (gtk::Box, gtk::Box) {
@@ -54,7 +74,7 @@ fn page(view: &gtk::ColumnView) -> (gtk::Box, gtk::Box) {
     (vbox, bar)
 }
 
-fn bar_button(label: &str, classes: &[&str], app: &App, bar: &gtk::Box, f: impl Fn(&App) + 'static) {
+fn bar_button(label: &str, classes: &[&str], app: &App, bar: &gtk::Box, f: impl Fn(&App) + 'static) -> gtk::Button {
     let b = gtk::Button::with_label(label);
     for c in classes {
         b.add_css_class(c);
@@ -62,6 +82,7 @@ fn bar_button(label: &str, classes: &[&str], app: &App, bar: &gtk::Box, f: impl 
     let app = app.clone();
     b.connect_clicked(move |_| f(&app));
     bar.append(&b);
+    b
 }
 
 fn window_action(app: &App, name: &str, f: impl Fn(&App) + 'static) {
@@ -90,7 +111,12 @@ fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate
               x: f64,
               y: f64| {
             selection.set_selected(position);
-            // The same order and entries as the page's toolbar.
+            // The same order and entries as the page's toolbar. ~/.ssh
+            // views and the hosts page have no export; hosts also have no
+            // rename (the aliases are edited in the properties).
+            let no_export = page == "ssh-hosts"
+                || (page == "ssh-keys" && app.pages.ssh_from_storage.get())
+                || (page == "ssh-certs" && app.pages.ssh_certs_from_storage.get());
             type Act = Box<dyn Fn(&App)>;
             let mut acts: Vec<(String, bool, Act)> = Vec::new();
             if page == "reqs" {
@@ -100,12 +126,29 @@ fn row_menu_cb(app: &App, selection: &gtk::SingleSelection, page: &str) -> crate
                     Box::new(|a: &App| a.sign_selected_request()),
                 ));
             }
-            acts.push((tr!("Export…"), false, Box::new(|a: &App| a.export_selected())));
-            if page == "keys" || page == "certs" {
+            if !no_export {
+                acts.push((tr!("Export…"), false, Box::new(|a: &App| a.export_selected())));
+            }
+            if page == "keys" || page == "certs" || page == "ssh-keys" || page == "ssh-certs" {
                 acts.push((tr!("Rename…"), false, Box::new(|a: &App| a.rename_selected())));
             }
             if page == "certs" {
                 acts.push((tr!("Revoke…"), false, Box::new(|a: &App| a.revoke_selected())));
+            }
+            // ~/.ssh rows move into the database from their context menu.
+            if page == "ssh-keys" && app.pages.ssh_from_storage.get() {
+                acts.push((
+                    tr!("Import into database…"),
+                    false,
+                    Box::new(|a: &App| a.import_selected_user_key()),
+                ));
+            }
+            if page == "ssh-certs" && app.pages.ssh_certs_from_storage.get() {
+                acts.push((
+                    tr!("Import into database…"),
+                    false,
+                    Box::new(|a: &App| a.import_selected_user_cert()),
+                ));
             }
             acts.push((tr!("Properties"), false, Box::new(|a: &App| a.details_selected())));
             acts.push((tr!("Delete"), true, Box::new(|a: &App| a.delete_selected())));
@@ -314,10 +357,85 @@ pub fn build(
         ],
     );
 
+    let ssh_keys_store = gtk::gio::ListStore::new::<PkiItemObject>();
+    let ssh_keys_sel = gtk::SingleSelection::new(Some(ssh_keys_store.clone()));
+    let ssh_keys_menu = crate::ui::columns::RowMenuSlot::default();
+    let ssh_keys_view = column_view(
+        &ssh_keys_sel,
+        vec![
+            text_column(&tr!("Name"), "name", true, Some(ssh_keys_menu.clone())),
+            text_column(&tr!("Type"), "detail", false, Some(ssh_keys_menu.clone())),
+            text_column(&tr!("Comment"), "extra", true, Some(ssh_keys_menu.clone())),
+            text_column(&tr!("Status"), "badge", false, Some(ssh_keys_menu.clone())),
+        ],
+    );
+    let ssh_certs_store = gtk::gio::ListStore::new::<PkiItemObject>();
+    let ssh_certs_sel = gtk::SingleSelection::new(Some(ssh_certs_store.clone()));
+    let ssh_certs_menu = crate::ui::columns::RowMenuSlot::default();
+    let ssh_certs_view = column_view(
+        &ssh_certs_sel,
+        vec![
+            text_column(&tr!("Name"), "name", true, Some(ssh_certs_menu.clone())),
+            text_column(&tr!("Key ID"), "detail", true, Some(ssh_certs_menu.clone())),
+            text_column(&tr!("Type"), "extra", false, Some(ssh_certs_menu.clone())),
+            text_column(&tr!("Validity"), "sig", false, Some(ssh_certs_menu.clone())),
+            text_column(&tr!("Status"), "badge", false, Some(ssh_certs_menu.clone())),
+        ],
+    );
+    let hosts_store = gtk::gio::ListStore::new::<PkiItemObject>();
+    let hosts_sel = gtk::SingleSelection::new(Some(hosts_store.clone()));
+    let hosts_menu = crate::ui::columns::RowMenuSlot::default();
+    let hosts_view = column_view(
+        &hosts_sel,
+        vec![
+            text_column(&tr!("Name"), "name", true, Some(hosts_menu.clone())),
+            text_column(&tr!("Address"), "detail", true, Some(hosts_menu.clone())),
+            text_column(&tr!("User"), "extra", false, Some(hosts_menu.clone())),
+            text_column(&tr!("Port"), "badge", false, Some(hosts_menu.clone())),
+            text_column(&tr!("Key"), "sig", false, Some(hosts_menu.clone())),
+        ],
+    );
+
     let (keys_page, keys_bar) = page(&keys_view);
     let (certs_page, certs_bar) = page(&certs_view);
     let (reqs_page, reqs_bar) = page(&reqs_view);
     let (crls_page, crls_bar) = page(&crls_view);
+    let (ssh_keys_page, ssh_keys_bar) = page(&ssh_keys_view);
+    let (ssh_certs_page, ssh_certs_bar) = page(&ssh_certs_view);
+    let (hosts_page, hosts_bar) = page(&hosts_view);
+
+    // One SSH section: the internal switcher splits Keys / Certificates /
+    // Hosts, like the original XCA nests item kinds under a section.
+    let ssh_stack = adw::ViewStack::new();
+    ssh_stack.add_titled_with_icon(
+        &ssh_keys_page,
+        Some("keys"),
+        &tr!("Keys"),
+        "dialog-password-symbolic",
+    );
+    ssh_stack.add_titled_with_icon(
+        &ssh_certs_page,
+        Some("certs"),
+        &tr!("Certificates"),
+        "application-certificate-symbolic",
+    );
+    ssh_stack.add_titled_with_icon(
+        &hosts_page,
+        Some("hosts"),
+        &tr!("Hosts"),
+        "network-server-symbolic",
+    );
+    let ssh_switcher = adw::ViewSwitcher::builder()
+        .policy(adw::ViewSwitcherPolicy::Narrow)
+        .stack(&ssh_stack)
+        .build();
+    let ssh_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    ssh_header.set_halign(gtk::Align::Center);
+    ssh_header.set_margin_top(6);
+    ssh_header.append(&ssh_switcher);
+    let ssh_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    ssh_page.append(&ssh_header);
+    ssh_page.append(&ssh_stack);
 
     let stack = adw::ViewStack::new();
     stack.add_titled_with_icon(
@@ -343,6 +461,12 @@ pub fn build(
         Some("crls"),
         &tr!("Revocation"),
         "security-low-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &ssh_page,
+        Some("ssh"),
+        &tr!("SSH"),
+        "utilities-terminal-symbolic",
     );
 
     // The signatures page is a tool page rather than a table: two actions
@@ -432,10 +556,23 @@ pub fn build(
             certs_children,
             reqs: reqs_store,
             crls: crls_store,
+            ssh_keys: ssh_keys_store,
+            ssh_certs: ssh_certs_store,
+            ssh_stack,
+            ssh_from_storage: std::cell::Cell::new(false),
+            ssh_user_keys: std::cell::RefCell::new(Vec::new()),
+            ssh_certs_from_storage: std::cell::Cell::new(false),
+            ssh_user_certs: std::cell::RefCell::new(Vec::new()),
+            ssh_config: std::cell::RefCell::new(crate::sshconf::load()),
+            ssh_host_ids: std::cell::RefCell::new(Vec::new()),
+            hosts: hosts_store,
+            hosts_sel,
             keys_sel,
             certs_sel,
             reqs_sel,
             crls_sel,
+            ssh_keys_sel,
+            ssh_certs_sel,
         }),
     };
 
@@ -501,6 +638,159 @@ pub fn build(
         a.delete_selected()
     });
 
+    // The keys side of the SSH section reads either the database or the
+    // user's ~/.ssh (read-only); linked toggles switch the source and the
+    // toolbar follows.
+    let src_db = gtk::ToggleButton::with_label(&tr!("Database"));
+    let src_fs = gtk::ToggleButton::with_label("~/.ssh");
+    src_db.set_active(true);
+    src_fs.set_group(Some(&src_db));
+    let src_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    src_box.add_css_class("linked");
+    src_box.set_valign(gtk::Align::Center);
+    src_box.append(&src_db);
+    src_box.append(&src_fs);
+    ssh_keys_bar.append(&src_box);
+
+    bar_button(
+        &tr!("New SSH Key…"),
+        &["suggested-action"],
+        &app,
+        &ssh_keys_bar,
+        |a| a.new_ssh_key_dialog(),
+    );
+    bar_button(
+        &tr!("New SSH Certificate…"),
+        &["flat"],
+        &app,
+        &ssh_keys_bar,
+        |a| a.new_ssh_cert_dialog(),
+    );
+    let ssh_import_file = bar_button(&tr!("Import…"), &["flat"], &app, &ssh_keys_bar, |a| {
+        a.import_dialog()
+    });
+    // "Import into database…" lives in the row context menu only.
+    let ssh_export = bar_button(&tr!("Export…"), &["flat"], &app, &ssh_keys_bar, |a| {
+        a.export_selected()
+    });
+    bar_button(&tr!("Rename…"), &["flat"], &app, &ssh_keys_bar, |a| {
+        a.rename_selected()
+    });
+    bar_button(&tr!("Properties"), &["flat"], &app, &ssh_keys_bar, |a| {
+        a.details_selected()
+    });
+    bar_button(
+        &tr!("Delete"),
+        &["flat", "destructive-action"],
+        &app,
+        &ssh_keys_bar,
+        |a| a.delete_selected(),
+    );
+    // In ~/.ssh mode the key operations target the files instead of the
+    // database; only the file import and export stay unavailable.
+    let db_only_buttons = vec![ssh_import_file.clone(), ssh_export.clone()];
+    src_db.connect_clicked({
+        let app = app.clone();
+        let db_only = db_only_buttons.clone();
+        move |b| {
+            if b.is_active() {
+                for b in &db_only {
+                    b.set_sensitive(true);
+                }
+                app.set_ssh_source(false);
+            }
+        }
+    });
+    src_fs.connect_clicked({
+        let app = app.clone();
+        let db_only = db_only_buttons.clone();
+        move |b| {
+            if b.is_active() {
+                for b in &db_only {
+                    b.set_sensitive(false);
+                }
+                app.set_ssh_source(true);
+            }
+        }
+    });
+
+    // The certificates side reads the database or ~/.ssh, mirroring the
+    // keys toolbar.
+    let cert_db = gtk::ToggleButton::with_label(&tr!("Database"));
+    let cert_fs = gtk::ToggleButton::with_label("~/.ssh");
+    cert_db.set_active(true);
+    cert_fs.set_group(Some(&cert_db));
+    let cert_src_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    cert_src_box.add_css_class("linked");
+    cert_src_box.set_valign(gtk::Align::Center);
+    cert_src_box.append(&cert_db);
+    cert_src_box.append(&cert_fs);
+    ssh_certs_bar.append(&cert_src_box);
+
+    bar_button(
+        &tr!("New SSH Certificate…"),
+        &["suggested-action"],
+        &app,
+        &ssh_certs_bar,
+        |a| a.new_ssh_cert_dialog(),
+    );
+    let cert_import_file = bar_button(&tr!("Import…"), &["flat"], &app, &ssh_certs_bar, |a| {
+        a.import_dialog()
+    });
+    // "Import into database…" lives in the row context menu only.
+    let cert_export = bar_button(&tr!("Export…"), &["flat"], &app, &ssh_certs_bar, |a| {
+        a.export_selected()
+    });
+    bar_button(&tr!("Rename…"), &["flat"], &app, &ssh_certs_bar, |a| {
+        a.rename_selected()
+    });
+    bar_button(&tr!("Properties"), &["flat"], &app, &ssh_certs_bar, |a| {
+        a.details_selected()
+    });
+    bar_button(
+        &tr!("Delete"),
+        &["flat", "destructive-action"],
+        &app,
+        &ssh_certs_bar,
+        |a| a.delete_selected(),
+    );
+    let cert_db_only = vec![cert_import_file.clone(), cert_export.clone()];
+    cert_db.connect_clicked({
+        let app = app.clone();
+        let db_only = cert_db_only.clone();
+        move |b| {
+            if b.is_active() {
+                for b in &db_only {
+                    b.set_sensitive(true);
+                }
+                app.set_ssh_certs_source(false);
+            }
+        }
+    });
+    cert_fs.connect_clicked({
+        let app = app.clone();
+        let db_only = cert_db_only.clone();
+        move |b| {
+            if b.is_active() {
+                for b in &db_only {
+                    b.set_sensitive(false);
+                }
+                app.set_ssh_certs_source(true);
+            }
+        }
+    });
+
+    // The hosts page edits ~/.ssh/config directly.
+    bar_button(&tr!("New Host…"), &["suggested-action"], &app, &hosts_bar, |a| {
+        a.new_host_dialog()
+    });
+    bar_button(&tr!("Properties"), &["flat"], &app, &hosts_bar, |a| {
+        a.details_selected()
+    });
+    bar_button(&tr!("Delete"), &["flat", "destructive-action"], &app, &hosts_bar, |a| {
+        a.delete_selected()
+    });
+
     bar_button(&tr!("Sign File…"), &["suggested-action"], &app, &sign_bar, |a| {
         a.sign_file_dialog()
     });
@@ -553,12 +843,73 @@ pub fn build(
                 crate::ui::dialogs::details::open_crl(&app2, &rec);
             }
     });
+    let app2 = app.clone();
+    ssh_keys_view.connect_activate(move |_, pos| {
+        let Some(obj) = app2
+            .pages
+            .ssh_keys
+            .item(pos)
+            .and_then(|o| o.downcast::<PkiItemObject>().ok())
+        else {
+            return;
+        };
+        if app2.pages.ssh_from_storage.get() {
+            if let Some(k) = app2.pages.ssh_user_keys.borrow().get(obj.id() as usize).cloned() {
+                crate::ui::dialogs::ssh::open_details_user_key(&app2, &k);
+            }
+        } else if let Some(rec) = app2.db.lock().unwrap().get_ssh_key(obj.id()).ok().flatten() {
+            crate::ui::dialogs::ssh::open_details_key(&app2, &rec);
+        }
+    });
+    let app2 = app.clone();
+    ssh_certs_view.connect_activate(move |_, pos| {
+        let Some(obj) = app2
+            .pages
+            .ssh_certs
+            .item(pos)
+            .and_then(|o| o.downcast::<PkiItemObject>().ok())
+        else {
+            return;
+        };
+        if app2.pages.ssh_certs_from_storage.get() {
+            if let Some(c) = app2
+                .pages
+                .ssh_user_certs
+                .borrow()
+                .get(obj.id() as usize)
+                .cloned()
+            {
+                crate::ui::dialogs::ssh::open_details_user_cert(&app2, &c);
+            }
+        } else if let Some(rec) = app2.db.lock().unwrap().get_ssh_cert(obj.id()).ok().flatten() {
+            crate::ui::dialogs::ssh::open_details_cert(&app2, &rec);
+        }
+    });
+    let app2 = app.clone();
+    hosts_view.connect_activate(move |_, pos| {
+        if let Some(obj) = app2
+            .pages
+            .hosts
+            .item(pos)
+            .and_then(|o| o.downcast::<PkiItemObject>().ok())
+            && let Some(bid) = app2
+                .pages
+                .ssh_host_ids
+                .borrow()
+                .get(obj.id() as usize)
+                .copied()
+        {
+            crate::ui::dialogs::ssh::open_host_editor(&app2, Some(bid));
+        }
+    });
 
     // ---- window actions + primary menu ----
     window_action(&app, "new-key", |a| a.new_key_dialog());
     window_action(&app, "new-cert", |a| a.new_cert_dialog());
     window_action(&app, "new-req", |a| a.new_req_dialog());
     window_action(&app, "new-crl", |a| a.new_crl_dialog());
+    window_action(&app, "new-ssh-key", |a| a.new_ssh_key_dialog());
+    window_action(&app, "new-ssh-cert", |a| a.new_ssh_cert_dialog());
     window_action(&app, "import", |a| a.import_dialog());
     window_action(&app, "token", |a| a.token_dialog());
     window_action(&app, "open-db", |a| a.open_database());
@@ -571,6 +922,8 @@ pub fn build(
     *certs_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.certs_sel, "certs"));
     *reqs_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.reqs_sel, "reqs"));
     *crls_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.crls_sel, "crls"));
+    *ssh_keys_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.ssh_keys_sel, "ssh-keys"));
+    *ssh_certs_menu.borrow_mut() = Some(row_menu_cb(&app, &app.pages.ssh_certs_sel, "ssh-certs"));
 
     ui_app.set_accels_for_action("win.new-key", &["<Control>N"]);
     ui_app.set_accels_for_action("win.new-cert", &["<Control>C"]);
@@ -583,6 +936,8 @@ pub fn build(
     sec_new.append(Some(&tr!("New Private Key…")), Some("win.new-key"));
     sec_new.append(Some(&tr!("New Certificate…")), Some("win.new-cert"));
     sec_new.append(Some(&tr!("New Request…")), Some("win.new-req"));
+    sec_new.append(Some(&tr!("New SSH Key…")), Some("win.new-ssh-key"));
+    sec_new.append(Some(&tr!("New SSH Certificate…")), Some("win.new-ssh-cert"));
     menu.append_section(None, &sec_new);
     let sec_file = gtk::gio::Menu::new();
     sec_file.append(Some(&tr!("Import from File…")), Some("win.import"));
@@ -604,6 +959,26 @@ pub fn build(
         .menu_model(&menu)
         .build();
     header.pack_start(&menu_btn);
+
+    // The Delete key deletes the selected item of the visible page. A
+    // bubble-phase key controller on the pages area (not an application
+    // accelerator): text entries consume Delete while editing — they all
+    // live in dialogs whose presentation sits outside this subtree — and
+    // the controller never sees keys aimed at an open dialog.
+    {
+        let app2 = app.clone();
+        let del = gtk::EventControllerKey::new();
+        del.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        del.connect_key_pressed(move |_, key, _, _| {
+            if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete) {
+                app2.delete_selected();
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        app.pages.stack.add_controller(del);
+    }
 
     app.refresh();
     window.present();

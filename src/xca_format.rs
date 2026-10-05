@@ -21,6 +21,14 @@ pub const T_CRL: i64 = 4;
 #[allow(dead_code)]
 pub const T_TEMPLATE: i64 = 5;
 
+// xca-rs-specific item types. High values keep clear of every pki_type
+// the original XCA may ever define; an original XCA opening our database
+// loads per-table (public_keys/certs/…) and simply never visits these
+// items, and its own CREATE TABLE IF NOT EXISTS run leaves our tables
+// untouched.
+pub const T_SSH_KEY: i64 = 100;
+pub const T_SSH_CERT: i64 = 101;
+
 // pki_base.h: enum pki_source
 pub const SRC_IMPORTED: i64 = 1;
 pub const SRC_GENERATED: i64 = 2;
@@ -47,6 +55,11 @@ CREATE TABLE IF NOT EXISTS crls (item INTEGER, hash INTEGER, num INTEGER, iss_ha
 CREATE TABLE IF NOT EXISTS revocations (caId INTEGER, serial VARCHAR(64), date CHAR(15), invaldate CHAR(15), crlNo INTEGER, reasonBit INTEGER, FOREIGN KEY (caId) REFERENCES items (id));
 CREATE TABLE IF NOT EXISTS templates (item INTEGER, version INTEGER, template TEXT, FOREIGN KEY (item) REFERENCES items (id));
 CREATE TABLE IF NOT EXISTS takeys (item INTEGER UNIQUE, value TEXT, FOREIGN KEY (item) REFERENCES items (id));
+CREATE TABLE IF NOT EXISTS ssh_keys (item INTEGER PRIMARY KEY, algo TEXT NOT NULL, is_ca INTEGER NOT NULL DEFAULT 0, comment TEXT NOT NULL DEFAULT '', "public" TEXT NOT NULL, private TEXT, FOREIGN KEY (item) REFERENCES items (id));
+CREATE TABLE IF NOT EXISTS ssh_certs (item INTEGER PRIMARY KEY, ca_key INTEGER, key_item INTEGER, cert TEXT NOT NULL, FOREIGN KEY (item) REFERENCES items (id), FOREIGN KEY (ca_key) REFERENCES items (id), FOREIGN KEY (key_item) REFERENCES items (id));
+CREATE INDEX IF NOT EXISTS i_ssh_keys_item ON ssh_keys (item);
+CREATE INDEX IF NOT EXISTS i_ssh_certs_item ON ssh_certs (item);
+CREATE INDEX IF NOT EXISTS i_ssh_certs_ca ON ssh_certs (ca_key);
 CREATE INDEX IF NOT EXISTS i_settings_key_ ON settings (key_);
 CREATE INDEX IF NOT EXISTS i_items_id ON items (id);
 CREATE INDEX IF NOT EXISTS i_public_keys_item ON public_keys (item);

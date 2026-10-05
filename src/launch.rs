@@ -26,6 +26,33 @@ pub fn open_main(app: &adw::Application, path: &Path, password: Option<String>) 
                 Ok("signbyca") => handle.new_cert_dialog(),
                 Ok("newcrl") => handle.new_crl_dialog(),
                 Ok("token") => handle.token_dialog(),
+                Ok("newsshkey") => handle.new_ssh_key_dialog(),
+                Ok("newsshcert") => handle.new_ssh_cert_dialog(),
+                Ok("sshsrc") => {
+                    // SSH section with the keys list reading ~/.ssh.
+                    handle.pages.stack.set_visible_child_name("ssh");
+                    handle.set_ssh_source(true);
+                }
+                Ok("sshhosts") => {
+                    // SSH section, hosts tab (~/.ssh/config).
+                    handle.pages.stack.set_visible_child_name("ssh");
+                    handle.pages.ssh_stack.set_visible_child_name("hosts");
+                }
+                Ok("newhost") => {
+                    handle.new_host_dialog();
+                }
+                Ok("newsshkeyfile") => {
+                    // Generate a key into ~/.ssh through the real dialog.
+                    handle.pages.stack.set_visible_child_name("ssh");
+                    handle.set_ssh_source(true);
+                    handle.new_ssh_key_dialog();
+                }
+                Ok("sshcertsrc") => {
+                    // SSH section, certificates tab, ~/.ssh source.
+                    handle.pages.stack.set_visible_child_name("ssh");
+                    handle.pages.ssh_stack.set_visible_child_name("certs");
+                    handle.set_ssh_certs_source(true);
+                }
                 Ok("props") => handle.details_selected(),
 _ => {}
             }

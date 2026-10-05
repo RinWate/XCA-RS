@@ -118,6 +118,47 @@ fn other_database_button(
     b
 }
 
+/// Flat button for the password windows: create a new database instead of
+/// unlocking the current one. The name is picked with a save dialog, then
+/// the normal first-run password setup runs for that file.
+fn new_database_button(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+) -> gtk::Button {
+    let b = gtk::Button::with_label(&tr!("Create new database…"));
+    b.add_css_class("flat");
+    b.set_halign(gtk::Align::Fill);
+    let app = app.clone();
+    let window = window.clone();
+    b.connect_clicked(move |_| {
+        let dlg = gtk::FileDialog::builder()
+            .title(tr!("New Database"))
+            .filters(&super::db_file_filters())
+            .accept_label(tr!("Create"))
+            .initial_name("xca-rs.xdb")
+            .build();
+        let app = app.clone();
+        let win = window.clone();
+        dlg.save(
+            Some(&window),
+            None::<&gtk::gio::Cancellable>,
+            move |res| {
+                let Ok(file) = res else { return };
+                let Some(path) = file.path() else { return };
+                if path.exists() {
+                    return super::error_dialog(
+                        &win,
+                        &tr!("The file already exists, choose another name"),
+                    );
+                }
+                win.close();
+                setup_new(&app, path);
+            },
+        );
+    });
+    b
+}
+
 /// First run: choose a database password (empty = no password).
 pub fn setup_new(app: &adw::Application, path: PathBuf) {
     let (window, group) = prompt(
@@ -138,6 +179,7 @@ pub fn setup_new(app: &adw::Application, path: PathBuf) {
     bar.append(&skip);
     bar.append(&ok);
     group.add(&other_database_button(app, &window, path.clone()));
+    group.add(&new_database_button(app, &window));
     group.add(&bar);
     enter_submits(&window, &ok, &[&pw1, &pw2]);
 
@@ -191,6 +233,7 @@ pub fn unlock(app: &adw::Application, path: PathBuf, wrong: bool) {
     ok.add_css_class("suggested-action");
     bar.append(&ok);
     group.add(&other_database_button(app, &window, path.clone()));
+    group.add(&new_database_button(app, &window));
     group.add(&bar);
     enter_submits(&window, &ok, &[&pw]);
 
