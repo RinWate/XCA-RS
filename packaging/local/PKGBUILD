@@ -17,7 +17,7 @@
 # Update pkgver below when bumping Cargo.toml.
 
 pkgname=xca-rs
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="XCA rewritten in Rust with GTK4 + GOST — local build from the working tree"
 arch=('x86_64')
