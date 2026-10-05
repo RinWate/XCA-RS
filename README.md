@@ -1,9 +1,5 @@
 # XCA RS
 
-> Attention! This program is 90% written using AI tools. The purpose of its creation was to quickly solve one specific task. I don’t claim to be an expert in the Rust language, and this project was created more for utilitarian purposes.
-
-> Внимание! Данная программа на 90% написана с использованием AI инструментов. Целью её создания было быстрое решение одной конкретной задачи. Я не претендую на профи языка Rust и этот проект скорее сделан в утилитарных целях.
-
 Переписанная с нуля на **Rust** версия [XCA](https://github.com/chris2511/xca)
 (X Certificate and Key Management) с интерфейсом на **GTK4 + libadwaita** —
 та же концепция приложения, что и у XCA (управление закрытыми ключами,
