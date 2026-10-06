@@ -941,7 +941,7 @@ pub fn sign_file_ex(
     )
     .map_err(|e| format!("CMS signing failed: {e}"))?;
     if cades {
-        finalize_cades(&cms, cert, data, flags)?;
+        finalize_cades(&cms, cert, key, data, flags)?;
     }
     cms.to_der().map_err(err)
 }
@@ -952,9 +952,10 @@ pub fn sign_file_ex(
 /// digested the data yet). The attribute carries the SHA-256 hash of the
 /// signing certificate plus its issuer/serial, letting verifiers bind the
 /// signature to an exact certificate — the mark of CAdES-BES.
-fn finalize_cades(
+fn finalize_cades<K: HasPrivate>(
     cms: &CmsContentInfoRef,
     cert: &X509Ref,
+    key: &PKeyRef<K>,
     data: &[u8],
     flags: CMSOptions,
 ) -> Result<(), String> {
@@ -985,7 +986,7 @@ fn finalize_cades(
         ) -> *mut std::ffi::c_void;
     }
     // The full X509_ATTRIBUTE DER: SEQ { OID, SET { SigningCertificateV2 } }.
-    let attr_der = signing_certificate_v2_der(cert)?;
+    let attr_der = signing_certificate_v2_der(cert, key)?;
     unsafe {
         let sis = CMS_get0_SignerInfos(cms.as_ptr());
         if sis.is_null() {
@@ -1062,14 +1063,42 @@ fn drain_openssl_errors() -> String {
 }
 
 /// DER of the whole signing-certificate-v2 X509_ATTRIBUTE.
-fn signing_certificate_v2_der(cert: &X509Ref) -> Result<Vec<u8>, String> {
+///
+/// The certificate hash algorithm follows the signing key (Р 1323565.1.23:
+/// GOST signatures hash the certificate with Streebog of the matching
+/// width; CryptoPro-based verifiers — Gosuslugi among them — recompute
+/// certHash with Streebog and reject a SHA-256 value). The algorithm is
+/// always spelled out explicitly, like CryptoPro CSP writes it.
+fn signing_certificate_v2_der<K: HasPrivate>(
+    cert: &X509Ref,
+    key: &PKeyRef<K>,
+) -> Result<Vec<u8>, String> {
     // ESSCertIDv2 ::= SEQ { certHash OCTET STRING, IssuerSerial }
     let cert_der = cert.to_der().map_err(err)?;
-    let hash = openssl::hash::hash(
-        openssl::hash::MessageDigest::sha256(),
-        &cert_der,
-    )
-    .map_err(err)?;
+    // (hash-algorithm DER, cert hash bytes) — Streebog for GOST keys of
+    // either width, SHA-256 for everything else.
+    let (hash_alg, hash): (Vec<u8>, Vec<u8>) = if is_gost_key(key) {
+        let (name, oid, len) = if key.id().as_raw() == gost_nids().1 && gost_nids().1 != 0 {
+            // 1.2.643.7.1.1.2.3, Streebog-512
+            (b"md_gost12_512", &[0x06, 0x08, 0x2A, 0x85, 0x03, 0x07, 0x01, 0x01, 0x02, 0x03][..], 64)
+        } else {
+            // 1.2.643.7.1.1.2.2, Streebog-256
+            (b"md_gost12_256", &[0x06, 0x08, 0x2A, 0x85, 0x03, 0x07, 0x01, 0x01, 0x02, 0x02][..], 32)
+        };
+        (
+            der_tlv(0x30, oid),
+            crate::cpcsp::engine_digest_n(name, &cert_der, len).map_err(err)?,
+        )
+    } else {
+        // 2.16.840.1.101.3.4.2.1, SHA-256 — explicit, in CryptoPro spirit.
+        let oid: &[u8] = &[0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+        (
+            der_tlv(0x30, oid),
+            openssl::hash::hash(MessageDigest::sha256(), &cert_der)
+                .map_err(err)?
+                .to_vec(),
+        )
+    };
     // IssuerSerial ::= SEQ { GeneralNames, SerialNumber }
     let issuer: Vec<u8> = unsafe {
         let mut out: *mut u8 = std::ptr::null_mut();
@@ -1100,10 +1129,17 @@ fn signing_certificate_v2_der(cert: &X509Ref) -> Result<Vec<u8>, String> {
     let serial = der_tlv(0x02, &mag);
     // IssuerSerial ::= SEQ { GeneralNames, SerialNumber }
     let issuer_serial = der_tlv(0x30, &der_concat(&[gn, serial]));
-    // ESSCertIDv2 ::= SEQ { certHash OCTET STRING, IssuerSerial }
-    let ess = der_tlv(0x30, &der_concat(&[der_tlv(0x04, &hash), issuer_serial]));
-    // SigningCertificateV2 ::= SEQ { SEQ OF ESSCertIDv2 }
-    let value = der_tlv(0x30, &ess);
+    // ESSCertIDv2 ::= SEQ { hashAlgorithm AlgorithmIdentifier,
+    //                       certHash OCTET STRING, IssuerSerial }
+    let ess = der_tlv(
+        0x30,
+        &der_concat(&[hash_alg, der_tlv(0x04, &hash), issuer_serial]),
+    );
+    // SigningCertificateV2 ::= SEQ { certs SEQ OF ESSCertIDv2, policies }
+    // — TWO nested SEQUENCEs around ESSCertIDv2. Strict PAdES verifiers
+    // (the УФО portal's CryptoPro path) miss the attribute entirely when
+    // the `certs` wrapper is collapsed.
+    let value = der_tlv(0x30, &der_tlv(0x30, &ess));
     // OID 1.2.840.113549.1.9.16.2.47
     let oid = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F]);
     // X509_ATTRIBUTE ::= SEQ { OID, SET OF value }
@@ -2443,6 +2479,106 @@ mod tests {
         assert!(!req_is_signed(req.as_ref(), std::slice::from_ref(&other)));
     }
 
+    /// CAdES signing-certificate-v2 for GOST keys must hash the signer
+    /// certificate with Streebog of the matching width (Р 1323565.1.23):
+    /// CryptoPro-based verifiers — Gosuslugi among them — recompute
+    /// certHash with Streebog and reject the RFC-5035 SHA-256 default.
+    #[test]
+    fn cades_gost_certificate_hash_is_streebog() {
+        for which in [0u8, 1u8] {
+            let key = generate_gost(which).unwrap();
+            let name = SubjectData {
+                cn: "CAdES GOST".into(),
+                ..Default::default()
+            }
+            .build_name()
+            .unwrap();
+            let cert = build_certificate(
+                &name,
+                &key,
+                &key,
+                None,
+                &CertParams {
+                    validity_days: 30,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let sig = sign_file_ex(
+                cert.as_ref(),
+                key.as_ref(),
+                b"payload",
+                SignatureKind::Detached,
+                &[],
+                SignatureProfile::CadesBes,
+            )
+            .unwrap();
+
+            let (oid, md_name, len) = if which == 1 {
+                // 1.2.643.7.1.1.2.3, Streebog-512
+                (
+                    [0x30u8, 0x0A, 0x06, 0x08, 0x2A, 0x85, 0x03, 0x07, 0x01, 0x01, 0x02, 0x03],
+                    b"md_gost12_512" as &[u8],
+                    64,
+                )
+            } else {
+                // 1.2.643.7.1.1.2.2, Streebog-256
+                (
+                    [0x30u8, 0x0A, 0x06, 0x08, 0x2A, 0x85, 0x03, 0x07, 0x01, 0x01, 0x02, 0x02],
+                    b"md_gost12_256" as &[u8],
+                    32,
+                )
+            };
+            assert!(
+                sig.windows(oid.len()).any(|w| w == oid),
+                "explicit Streebog AlgorithmIdentifier (which={which})"
+            );
+            let expected =
+                crate::cpcsp::engine_digest_n(md_name, &cert.to_der().unwrap(), len).unwrap();
+            assert!(
+                sig.windows(len).any(|w| w == expected.as_slice()),
+                "certHash = Streebog(cert) (which={which})"
+            );
+            assert_eq!(
+                verify_signature_detailed(&sig, Some(b"payload"), &[cert]).outcome,
+                VerifyOutcome::Trusted
+            );
+
+            // RFC 5035 nesting: the attribute value must be
+            // SET { SigningCertificateV2 { certs { ESSCertIDv2 {…} } } }
+            // — THREE nested SEQUENCEs. With the `certs` wrapper collapsed
+            // the strict PAdES verifiers (the УФО portal) report the whole
+            // attribute as missing.
+            let at = sig
+                .windows(13)
+                .rposition(|w| {
+                    w == [0x06u8, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F].as_slice()
+                })
+                .unwrap_or_else(|| sig.len().saturating_sub(1));
+            let mut pos = at + 13;
+            let mut seqs = 0;
+            while let Some(&tag) = sig.get(pos) {
+                if tag != 0x31 && tag != 0x30 {
+                    break;
+                }
+                // skip the TLV header (short or long form)
+                let l = sig[pos + 1] as usize;
+                let hdr = if l & 0x80 == 0 { 2 } else { 2 + (l & 0x7F) };
+                if tag == 0x30 {
+                    seqs += 1;
+                }
+                if tag == 0x31 {
+                    pos += hdr; // descend INTO the SET, not past it
+                } else if seqs < 3 {
+                    pos += hdr; // descend into each SEQUENCE level
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(seqs, 3, "SET must wrap exactly three SEQUENCEs (which={which})");
+        }
+    }
+
     /// Full GOST round trip, skipped when the gost engine is unavailable.
     #[test]
     fn gost_keygen_cert_and_cms() {
@@ -2919,4 +3055,3 @@ mod tests {
         assert!(same_public_key(mine2_pkey.as_ref(), expect.as_ref()));
     }
 }
-

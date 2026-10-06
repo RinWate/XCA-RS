@@ -2,11 +2,11 @@
 //! the database — CMS detached (`.p7s`) and attached (`.p7m`) signatures,
 //! embedded PDF signatures with a visible stamp — and verify them back.
 
-use super::pdf_place::{self, Placement, STAMP_W};
+use super::pdf_place::{self, Placement};
 use super::{action_row, combo, error_dialog, form_dialog, switch};
 use crate::app::App;
 use crate::crypto::{self, SignatureKind};
-use crate::pdf_sign::{self, StampOpts};
+use crate::pdf_sign::{self, StampOpts, STAMP_W};
 use crate::tr;
 use gtk::prelude::*;
 use libadwaita as adw;
@@ -77,9 +77,28 @@ const PDF_SIG_EXTS: [&str; 3] = ["sgn", "p7s", "sig"];
 const PDF_PROFILE_CADES: u32 = 0;
 const PDF_PROFILE_PKCS7: u32 = 1;
 
+/// The bold first line of the stamp plate: the subject CN. Legal-entity
+/// certificates (УФК, вузы, администрации…) routinely carry CN identical
+/// to O — printing both puts the same long organization string on the
+/// plate twice — so when CN duplicates O the line is left EMPTY (the
+/// renderer skips it; the full-DN fallback must NOT kick in here, or the
+/// header swallows the whole subject). The DN stays the fallback only
+/// for subjects with no CN at all.
+fn stamp_header(subj: &openssl::x509::X509NameRef, org: &str) -> String {
+    let cn = crypto::name_cn(subj).unwrap_or_default();
+    if cn.trim().is_empty() {
+        crypto::name_to_string(subj)
+    } else if cn.trim() == org.trim() {
+        String::new()
+    } else {
+        cn
+    }
+}
+
 /// A fresh `<stem> подписано` folder next to the source file, suffixed
 /// `(2)`, `(3)`… while the name is taken.
 fn unique_signed_folder(parent: &std::path::Path, stem: &str) -> PathBuf {
+
     let mut folder = parent.join(format!("{} {}", stem, tr!("signed")));
     let mut attempt = 2u32;
     while folder.exists() {
@@ -368,8 +387,8 @@ pub fn open_sign(app: &App) {
                     let field = |nid: openssl::nid::Nid| {
                         crypto::subject_field(subj, nid).unwrap_or_default()
                     };
-                    let signer = crypto::name_cn(subj)
-                        .unwrap_or_else(|| crypto::name_to_string(subj));
+                    let org = field(openssl::nid::Nid::ORGANIZATIONNAME);
+                    let signer = stamp_header(subj, &org);
                     let now = gtk::glib::DateTime::now_local()
                         .or_else(|_| gtk::glib::DateTime::now_utc())
                         .map(|d| d.format("%d.%m.%Y %H:%M").unwrap_or_default().to_string())
@@ -381,7 +400,7 @@ pub fn open_sign(app: &App) {
                         width: STAMP_W,
                         signer,
                         datetime: now,
-                        organization: field(openssl::nid::Nid::ORGANIZATIONNAME),
+                        organization: org,
                         title: field(openssl::nid::Nid::TITLE),
                         fingerprint: crypto::cert_fingerprint_hex(cert.as_ref())
                             .unwrap_or_default(),
@@ -903,4 +922,51 @@ fn present_pdf_report(
         });
     }
     form.dlg.present(Some(&app.window));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_header;
+    use openssl::nid::Nid;
+    use openssl::x509::X509Name;
+
+    fn name(o: Option<&str>, cn: Option<&str>) -> X509Name {
+        let mut b = X509Name::builder().unwrap();
+        if let Some(o) = o {
+            b.append_entry_by_nid(Nid::ORGANIZATIONNAME, o).unwrap();
+        }
+        if let Some(cn) = cn {
+            b.append_entry_by_nid(Nid::COMMONNAME, cn).unwrap();
+        }
+        b.build()
+    }
+
+    #[test]
+    fn stamp_header_drops_cn_equal_to_org() {
+        // The typical legal-entity certificate: CN is a copy of O — the
+        // header must be EMPTY (line skipped), not the full DN fallback.
+        let org = "ТОЛЬЯТТИНСКИЙ ГОСУДАРСТВЕННЫЙ УНИВЕРСИТЕТ";
+        let n = name(Some(org), Some(org));
+        assert_eq!(stamp_header(&n, org), "");
+        // Surrounding whitespace must not keep the duplicate alive.
+        let n = name(Some(org), Some(&format!("  {org} ")));
+        assert_eq!(stamp_header(&n, org), "");
+    }
+
+    #[test]
+    fn stamp_header_keeps_distinct_cn() {
+        let n = name(Some("Организация"), Some("Иванов Иван Иванович"));
+        assert_eq!(stamp_header(&n, "Организация"), "Иванов Иван Иванович");
+        // No O in the subject at all — the CN line stays too.
+        let n = name(None, Some("Иванов Иван Иванович"));
+        assert_eq!(stamp_header(&n, ""), "Иванов Иван Иванович");
+    }
+
+    #[test]
+    fn stamp_header_falls_back_to_dn_without_cn() {
+        // No CN — the full DN is the only identifying text for the header.
+        let n = name(Some("Организация"), None);
+        let s = stamp_header(&n, "Организация");
+        assert!(s.contains("Организация"), "header keeps identifying text: {s}");
+    }
 }

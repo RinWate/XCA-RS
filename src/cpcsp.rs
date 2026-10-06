@@ -312,6 +312,15 @@ fn gost94(data: &[u8]) -> Result<[u8; 32], String> {
 /// OID. Resolved MDs are cached: the PFX KDF calls this thousands of
 /// times per import and fetched provider MDs are refcounted.
 fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
+    let out = engine_digest_n(name, data, 32)?;
+    let mut fixed = [0u8; 32];
+    fixed.copy_from_slice(&out);
+    Ok(fixed)
+}
+
+/// The variable-length variant of [`engine_digest`] (Streebog-512 needs
+/// 64 bytes; everything else in the app uses 32).
+pub(crate) fn engine_digest_n(name: &[u8], data: &[u8], out_len: usize) -> Result<Vec<u8>, String> {
     unsafe extern "C" {
         fn EVP_MD_fetch(
             ctx: *mut openssl_sys::OSSL_LIB_CTX,
@@ -380,7 +389,7 @@ fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
             return Err("EVP_MD_CTX_new failed".to_string());
         }
         let mut ok = openssl_sys::EVP_DigestInit_ex(ctx, md, engine) == 1;
-        let mut out = [0u8; 32];
+        let mut out = vec![0u8; out_len];
         let mut len = 0u32;
         if ok {
             ok = openssl_sys::EVP_DigestUpdate(ctx, data.as_ptr().cast(), data.len()) == 1;
@@ -389,7 +398,7 @@ fn engine_digest(name: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
             ok = openssl_sys::EVP_DigestFinal_ex(ctx, out.as_mut_ptr(), &mut len) == 1;
         }
         openssl_sys::EVP_MD_CTX_free(ctx);
-        if !ok || len != 32 {
+        if !ok || len as usize != out_len {
             return Err("digest failed".to_string());
         }
         Ok(out)

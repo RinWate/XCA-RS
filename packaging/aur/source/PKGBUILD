@@ -4,7 +4,7 @@
 # checksum, build-test with `makepkg -si`, then refresh .SRCINFO.
 
 pkgname=xca-rs
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=3
 pkgdesc="XCA (X Certificate and Key Management) rewritten in Rust with GTK4 and GOST support"
 arch=('x86_64')

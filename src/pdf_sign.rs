@@ -13,6 +13,12 @@ use openssl::pkey::{PKeyRef, Private};
 use openssl::x509::{X509, X509Ref};
 use std::fmt::Write as _;
 
+/// Stamp plate width in points. Sized so the certificate fingerprint —
+/// 64 hex chars at 5.4pt monospace ≈ 208pt unhinted — stays on one line
+/// (text area = width − 28 circle − 8 margin); `pdf_place` uses it for
+/// the placement ghost rectangle too.
+pub const STAMP_W: f64 = 250.0;
+
 /// Where and what to draw as the visible signature stamp.
 pub struct StampOpts {
     /// 1-based page number.
@@ -24,7 +30,9 @@ pub struct StampOpts {
     pub width: f64,
     /// Plate lines: signer CN, signing date/time, title (position),
     /// organization — the title/org lines are skipped when the certificate
-    /// has no such attribute — and the continuous certificate fingerprint.
+    /// has no such attribute, and the signer line is skipped when CN
+    /// equals O (legal-entity certificates), so the organization string
+    /// is not printed twice — and the continuous certificate fingerprint.
     pub signer: String,
     pub datetime: String,
     pub organization: String,
@@ -158,8 +166,11 @@ fn build_stamped_update(
 /// bytes shifts the update's absolute offsets, so every xref entry of the
 /// update (and its `startxref`) is fixed up by the inserted length. Must
 /// run before `splice_signature`: the /ByteRange offsets are computed from
-/// the final layout. Documents saved with a cross-reference stream (no
-/// classic `xref` table in the update) are left untouched.
+/// the final layout. Classic-table updates are re-pointed record by
+/// record; cross-reference-stream updates via `patch_xref_stream_update`,
+/// which is fully validated FIRST — an unpatchable stream keeps the update
+/// header-less (a valid file) instead of gaining a header over stale
+/// offsets (a corrupt one).
 fn add_update_header(out: &mut Vec<u8>, orig_len: usize) {
     // Match the original header's version, e.g. `%PDF-1.3`.
     let version: Vec<u8> = out
@@ -179,11 +190,28 @@ fn add_update_header(out: &mut Vec<u8>, orig_len: usize) {
     // newline lopdf appends when the original does not end with one.
     let start = orig_len + usize::from(out.get(orig_len) == Some(&b'\n'));
     let delta = header.len();
-    let xref_at = match out[start..].windows(5).rposition(|w| w == b"\nxref") {
-        Some(rel) => start + rel + 1,
-        None => return,
+    let classic = out[start..].windows(5).rposition(|w| w == b"\nxref").map(|rel| start + rel + 1);
+    let stream_layout = if classic.is_none() {
+        match locate_xref_stream(out, start) {
+            Some(l) => Some(l),
+            None => return, // cannot patch the offsets — do not insert
+        }
+    } else {
+        None
     };
     out.splice(start..start, header);
+
+    let Some(xref_at) = classic else {
+        // The layout was computed pre-splice; every position it holds is
+        // inside the update, so the inserted header shifts them by delta.
+        let Some(mut layout) = stream_layout else {
+            return;
+        };
+        layout.sx += delta;
+        layout.data_at += delta;
+        patch_xref_stream_update(out, start, delta, &layout);
+        return;
+    };
 
     // Rewrite the update's xref entries: `ooo ggggg n` records whose offset
     // points inside the update shift by `delta`; entries pointing into the
@@ -231,20 +259,120 @@ fn add_update_header(out: &mut Vec<u8>, orig_len: usize) {
 
     // startxref points at the update's xref — shift it too.
     if let Some(at) = out.windows(9).rposition(|w| w == b"startxref") {
-        let mut num_at = at + 9;
-        while num_at < out.len() && out[num_at].is_ascii_whitespace() {
-            num_at += 1;
-        }
-        let num_end = num_at + out[num_at..].iter().take_while(|b| b.is_ascii_digit()).count();
-        if let Ok(v) = std::str::from_utf8(&out[num_at..num_end])
-            .map_err(|_| ())
-            .and_then(|s| s.parse::<u64>().map_err(|_| ()))
-        {
-            let shifted = v as usize + delta;
-            let field = format!("{shifted}");
-            out.splice(num_at..num_end, field.bytes().collect::<Vec<u8>>());
+        shift_startxref(out, at, delta);
+    }
+}
+
+/// Rewrite the `startxref` number at `at` (offset of the keyword) to
+/// `+ delta`. The digits may change width: nothing follows the number
+/// but `%%EOF`, so the splice cannot shift anything that matters.
+fn shift_startxref(out: &mut Vec<u8>, at: usize, delta: usize) -> bool {
+    let mut num_at = at + 9;
+    while num_at < out.len() && out[num_at].is_ascii_whitespace() {
+        num_at += 1;
+    }
+    let num_end = num_at + out[num_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if let Ok(v) = std::str::from_utf8(&out[num_at..num_end])
+        .map_err(|_| ())
+        .and_then(|s| s.parse::<u64>().map_err(|_| ()))
+    {
+        let shifted = v as usize + delta;
+        let field = format!("{shifted}");
+        out.splice(num_at..num_end, field.bytes().collect::<Vec<u8>>());
+        return true;
+    }
+    false
+}
+
+/// A validated cross-reference-stream update: everything `patch_xref_
+/// stream_update` needs, checked up front so the caller only inserts the
+/// `%PDF` header when the offsets can actually be fixed.
+struct XrefStreamLayout {
+    /// Offset of the `startxref` keyword (its number points at the stream
+    /// object and must be shifted along).
+    sx: usize,
+    /// Offset of the first stream-entry byte (after `stream\n`).
+    data_at: usize,
+    /// Total entries across all `/Index` ranges — `data_at + entries*7`
+    /// is validated against the `endstream` position.
+    entries: usize,
+}
+
+/// Locate and fully validate the update's cross-reference stream: the
+/// `startxref` chain must lead to an object inside the update, the dict
+/// must carry `/W[1 4 2]` and an `/Index`, no `/Filter` (compressed
+/// entries cannot be patched in place), and every entry must fit inside
+/// the stream data. `None` = do not touch this file.
+fn locate_xref_stream(out: &[u8], start: usize) -> Option<XrefStreamLayout> {
+    let sx = out.windows(9).rposition(|w| w == b"startxref")?;
+    let mut num_at = sx + 9;
+    while num_at < out.len() && out[num_at].is_ascii_whitespace() {
+        num_at += 1;
+    }
+    let num_end = num_at + out[num_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let obj_at = std::str::from_utf8(&out[num_at..num_end])
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())?;
+    if obj_at < start {
+        return None; // startxref points into the original — not ours to shift
+    }
+    // The xref stream object: `N 0 obj <<dict>> stream\n<data> endstream`.
+    let srel = out[obj_at..].windows(7).position(|w| w == b"stream\n")?;
+    let dict = &out[obj_at..obj_at + srel];
+    if dict.windows(7).any(|w| w == b"/Filter") {
+        return None; // compressed — cannot patch in place
+    }
+    if !dict.windows(9).any(|w| w == b"/W[1 4 2]") {
+        return None;
+    }
+    let i = dict.windows(7).position(|w| w == b"/Index[")?;
+    let seg = &dict[i + 7..];
+    let end = seg.iter().position(|&b| b == b']')?;
+    let nums: Vec<usize> = std::str::from_utf8(&seg[..end])
+        .ok()?
+        .split_whitespace()
+        .map(|t| t.parse::<usize>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if nums.is_empty() || nums.len() % 2 != 0 {
+        return None;
+    }
+    let entries: usize = nums.chunks(2).map(|c| c[1]).sum();
+    let data_at = obj_at + srel + b"stream\n".len();
+    let data_end = out[data_at..]
+        .windows(9)
+        .position(|w| w == b"endstream")
+        .map(|rel| data_at + rel)?;
+    // W[1 4 2] → 7 bytes per entry; all ranges must fit in the stream.
+    (data_at + entries * 7 <= data_end).then_some(XrefStreamLayout { sx, data_at, entries })
+}
+
+/// Fix up an update saved as a CROSS-REFERENCE STREAM (lopdf keeps the
+/// original's stream style; classic files take the table path above).
+/// The stream entries are `[type u32 offset u16 gen]` (W[1 4 2]); every
+/// type-1 offset pointing into the update shifts by `delta`, and the
+/// trailer's `startxref` shifts along. The layout comes pre-validated
+/// from `locate_xref_stream`.
+fn patch_xref_stream_update(
+    out: &mut Vec<u8>,
+    start: usize,
+    delta: usize,
+    l: &XrefStreamLayout,
+) {
+    let entry_len = 7; // W[1 4 2]
+    let end = l.data_at + l.entries * entry_len;
+    for pos in (l.data_at..end).step_by(entry_len) {
+        if out[pos] == 1 {
+            let off = u32::from_be_bytes([out[pos + 1], out[pos + 2], out[pos + 3], out[pos + 4]])
+                as usize;
+            if off >= start {
+                let shifted = (off + delta) as u32;
+                out[pos + 1..pos + 5].copy_from_slice(&shifted.to_be_bytes());
+            }
         }
     }
+    // startxref itself points at the stream object inside the update.
+    let _ = shift_startxref(out, l.sx, delta);
 }
 
 /// Create the signature field (+ appearance objects) and return its id.
@@ -534,12 +662,18 @@ fn splice_signature(
     ph.extend(std::iter::repeat_n(b'0', placeholder_len * 2));
     ph.push(b'>');
     let ph_at = find_unique(out, &ph)?;
-    let s = ph_at + 1;
-    let e = s + placeholder_len * 2;
+    // The excluded zone covers <HEX> WITH the angle brackets — the
+    // CryptoPro/УФО convention. The Adobe style (brackets outside the
+    // gap) makes strict extractors read the CMS one byte off and reject
+    // the file as "not a signed message".
+    let s = ph_at;
+    let e = s + placeholder_len * 2 + 2;
 
     // Locate the ByteRange dummy array; the replacement keeps the exact
-    // same byte width (numbers written compactly, the rest padded with
-    // spaces before the closing bracket), so nothing after it shifts.
+    // same byte width. The padding goes AFTER the closing bracket (the
+    // CryptoPro/Adobe byte shape `…NNNN]   /Contents`): validators that
+    // regex the array strictly as `[ n n n n]` choke on spaces between
+    // the last digit and `]`.
     let br_pattern = format!("/ByteRange[0 {BR_DUMMY} {BR_DUMMY} {BR_DUMMY}]");
     let br_at = find_unique(out, br_pattern.as_bytes())?;
     let open_at = br_at + b"/ByteRange".len();
@@ -555,7 +689,7 @@ fn splice_signature(
     }
     let mut replacement = compact;
     while replacement.len() < total_span {
-        replacement.insert(replacement.len() - 1, ' ');
+        replacement.push(' ');
     }
     out[open_at..=close_at].copy_from_slice(replacement.as_bytes());
 
@@ -574,7 +708,8 @@ fn splice_signature(
     for _ in der.len()..placeholder_len {
         hex.push_str("00");
     }
-    out[s..e].copy_from_slice(hex.as_bytes());
+    let hex_at = ph_at + 1; // inside the < >
+    out[hex_at..hex_at + placeholder_len * 2].copy_from_slice(hex.as_bytes());
     Ok(())
 }
 
@@ -655,7 +790,11 @@ pub fn extract_pdf_signatures(bytes: &[u8]) -> Vec<PdfSignature> {
         if !ft_is_sig {
             continue;
         }
-        let Ok(v) = dict.get(b"V").and_then(Object::as_dict) else {
+        let Ok((_, v_obj)) = doc.dereference(dict.get(b"V").ok().unwrap_or(&Object::Null))
+        else {
+            continue;
+        };
+        let Ok(v) = v_obj.as_dict() else {
             continue;
         };
         let Some(sig) = signature_from_dict(bytes, v) else { continue };
@@ -749,6 +888,19 @@ fn der_total_len(der: &[u8]) -> Option<usize> {
 
 // ---- the visible stamp plate (cairo) ----
 
+/// Font options shared by the measure and the render contexts. Hinting
+/// rounds glyph advances to whole device pixels, so the same text
+/// measures differently at different surface scales: a line that fits
+/// when wrapped on the 1x measure context grew ~6% on the 2x render
+/// context and the fingerprint ran into the plate border. Unhinted
+/// metrics scale linearly, making both contexts agree exactly.
+fn unhinted_font_options() -> gtk::cairo::FontOptions {
+    let mut fo = gtk::cairo::FontOptions::new().expect("default font options");
+    fo.set_hint_style(gtk::cairo::HintStyle::None);
+    fo.set_hint_metrics(gtk::cairo::HintMetrics::Off);
+    fo
+}
+
 /// One rendered text line of the stamp.
 struct StampLine {
     text: String,
@@ -811,6 +963,7 @@ fn stamp_layout(s: &StampOpts) -> (Vec<StampLine>, f64) {
 
     let surface = ImageSurface::create(Format::ARgb32, 1, 1).expect("measure surface");
     let cr = Context::new(&surface).expect("measure context");
+    cr.set_font_options(&unhinted_font_options());
     let avail = s.width - 28.0 - 8.0; // text starts after the check circle
 
     let fp_text = fingerprint_text(&s.fingerprint);
@@ -918,6 +1071,7 @@ fn render_stamp(
     let mut surface = ImageSurface::create(Format::ARgb32, w_px, h_px)
         .expect("stamp surface");
     let cr = Context::new(&surface).expect("stamp context");
+    cr.set_font_options(&unhinted_font_options());
     cr.scale(2.0, 2.0);
 
     let w = w_px as f64 / 2.0;
@@ -1125,6 +1279,46 @@ mod tests {
         out.into_bytes()
     }
 
+    /// The same one-page document stored with a cross-reference STREAM
+    /// (PDF 1.5 style, like bank and government print-outs). The
+    /// incremental update lopdf writes over it becomes an xref stream
+    /// too — the update-header path that used to be skipped.
+    pub(crate) fn fixture_pdf_xref() -> Vec<u8> {
+        let mut out = String::from("%PDF-1.5\n");
+        let mut offsets = [0usize; 4];
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << >> >>",
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            offsets[i] = out.len();
+            let _ = write!(out, "{} 0 obj\n{}\nendobj\n", i + 1, body);
+        }
+        // Object 4 is the xref stream itself; W[1 4 2] entries for
+        // objects 0..=4, uncompressed (the lopdf writer style we patch).
+        let mut entries: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 0]; // object 0: free
+        for off in &offsets[..3] {
+            entries.push(1);
+            entries.extend_from_slice(&(*off as u32).to_be_bytes());
+            entries.extend_from_slice(&0u16.to_be_bytes());
+        }
+        let obj4_at = out.len();
+        entries.push(1);
+        entries.extend_from_slice(&(obj4_at as u32).to_be_bytes());
+        entries.extend_from_slice(&0u16.to_be_bytes());
+        let _ = write!(
+            out,
+            "4 0 obj\n<< /Type /XRef /Size 5 /W[1 4 2] /Index[0 5] /Root 1 0 R /Length {} >>\nstream\n",
+            entries.len()
+        );
+        let mut bytes = out.into_bytes();
+        bytes.extend_from_slice(&entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{obj4_at}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
     pub(crate) fn self_signed(
         cn: &str,
     ) -> (openssl::x509::X509, openssl::pkey::PKey<openssl::pkey::Private>) {
@@ -1142,6 +1336,72 @@ mod tests {
         )
         .unwrap();
         (cert, key)
+    }
+
+    #[test]
+    fn fingerprint_fits_on_one_line() {
+        // STAMP_W exists precisely so the full 64-hex fingerprint stays
+        // on a single line at 5.4pt monospace.
+        let s = StampOpts {
+            page: 1,
+            x: 40.0,
+            y: 120.0,
+            width: STAMP_W,
+            signer: "Тестовый подписант".into(),
+            datetime: "06.10.2026 12:00".into(),
+            organization: "Организация".into(),
+            title: "Должность".into(),
+            fingerprint: "0123456789abcdef".repeat(4),
+        };
+        let (lines, _) = stamp_layout(&s);
+        let fps: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.mono)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(fps.len(), 1, "fingerprint must be one line: {fps:?}");
+        assert_eq!(fps[0].len(), 64, "nothing may be truncated");
+    }
+
+    #[test]
+    fn stamp_lines_fit_the_plate_at_render_scale() {
+        // The plate text is wrapped against the 1x measure context but
+        // drawn on the 2x render context; with per-context hinting the
+        // advances disagreed and the fingerprint ran into the border.
+        // Every wrapped line must fit `avail` measured at render scale.
+        use gtk::cairo::{Context, FontSlant, FontWeight, Format, ImageSurface};
+        let s = StampOpts {
+            page: 1,
+            x: 40.0,
+            y: 120.0,
+            width: 210.0,
+            signer: "Тестовый подписант с длинным именем".into(),
+            datetime: "06.10.2026 12:00".into(),
+            organization: "Организация с очень длинным наименованием".into(),
+            title: "Должность".into(),
+            fingerprint: "0123456789abcdef".repeat(4),
+        };
+        let (lines, _) = stamp_layout(&s);
+        assert!(lines.len() >= 2, "fingerprint must wrap");
+        let avail = s.width - 28.0 - 8.0;
+        let surface = ImageSurface::create(Format::ARgb32, 1, 1).unwrap();
+        let cr = Context::new(&surface).unwrap();
+        cr.set_font_options(&unhinted_font_options());
+        cr.scale(2.0, 2.0); // the geometry render_stamp draws with
+        for line in &lines {
+            cr.select_font_face(
+                if line.mono { "monospace" } else { "sans" },
+                FontSlant::Normal,
+                if line.bold { FontWeight::Bold } else { FontWeight::Normal },
+            );
+            cr.set_font_size(line.size);
+            let w = cr.text_extents(&line.text).map(|e| e.x_advance()).unwrap();
+            assert!(
+                w <= avail + 1e-6,
+                "line {:?} overflows the plate: {w:.2} > {avail:.2}",
+                line.text
+            );
+        }
     }
 
     #[test]
@@ -1186,6 +1446,94 @@ mod tests {
         tampered[at - 1] ^= 1;
         let report = crypto::verify_signature_detailed(&der, Some(&tampered), &[]);
         assert_eq!(report.outcome, VerifyOutcome::Invalid);
+    }
+
+    #[test]
+    fn signs_pdf_with_xref_stream_update() {
+        // Over an xref-stream original the update is an xref stream too;
+        // the %PDF update header must still be inserted and the binary
+        // offsets inside the stream fixed up — parsers that locate the
+        // newest revision by the LAST %PDF marker otherwise never see
+        // the signature at all.
+        let (cert, key) = self_signed("Xref Stream");
+        let orig = fixture_pdf_xref();
+        let signed = sign_pdf(&orig, cert.as_ref(), key.as_ref(), &[], None).unwrap();
+        assert!(signed.starts_with(&orig), "original bytes must stay");
+        let upd_at = orig.len() + usize::from(signed.get(orig.len()) == Some(&b'\n'));
+        assert!(
+            signed[upd_at..].starts_with(b"%PDF-"),
+            "the update must open with its own %PDF header"
+        );
+        // startxref must land on the update's xref stream object.
+        let at = signed.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let mut n = at + 9;
+        while signed[n].is_ascii_whitespace() {
+            n += 1;
+        }
+        let end = n + signed[n..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let sx: usize = std::str::from_utf8(&signed[n..end]).unwrap().parse().unwrap();
+        assert!(
+            signed[sx..(sx + 400).min(signed.len())]
+                .windows(10)
+                .any(|w| w == b"/Type/XRef"),
+            "startxref must hit the update's xref stream object"
+        );
+        // And the signature round-trips through the patched structure.
+        let sigs = extract_pdf_signatures(&signed);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            crypto::verify_signature_detailed(
+                &sigs[0].cms,
+                Some(&sigs[0].data),
+                std::slice::from_ref(&cert)
+            )
+            .outcome,
+            crypto::VerifyOutcome::Trusted
+        );
+    }
+
+    #[test]
+    fn byte_range_bracket_hugs_the_last_number() {
+        // CryptoPro/Adobe byte shape `…NNNN]   /Contents`: strict
+        // array regexes like `\[(\d+) (\d+) (\d+) (\d+)\]` reject a
+        // space between the last digit and `]`, so the fixed-width
+        // padding must live AFTER the bracket — in both update styles.
+        for orig in [fixture_pdf(), fixture_pdf_xref()] {
+            let (cert, key) = self_signed("ByteRange Shape");
+            let signed = sign_pdf(&orig, cert.as_ref(), key.as_ref(), &[], None).unwrap();
+            let br = signed.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+            let open = br + b"/ByteRange".len();
+            let close = open + signed[open..].iter().position(|&b| b == b']').unwrap();
+            assert!(
+                signed[close - 1].is_ascii_digit(),
+                "the closing bracket must follow a digit directly"
+            );
+            let rest = &signed[close + 1..];
+            let trimmed = rest
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map(|p| &rest[p..])
+                .unwrap();
+            assert!(
+                trimmed.starts_with(b"/Contents"),
+                "only spaces may sit between ] and /Contents"
+            );
+            // The CryptoPro/УФО gap convention: the excluded zone covers
+            // <HEX> WITH the angle brackets. Strict extractors index the
+            // gap as [b1..b2) and expect the CMS hex between the '<' and
+            // '>' inside it; the Adobe style (brackets outside) reads
+            // the DER one byte off and the file is rejected as "not a
+            // signed message".
+            let nums: Vec<usize> = std::str::from_utf8(&signed[open + 1..close])
+                .unwrap()
+                .split_whitespace()
+                .map(|t| t.parse().unwrap())
+                .collect();
+            let (b1, b2) = (nums[1], nums[2]);
+            assert_eq!(signed[b1], b'<', "the gap must open at the '<'");
+            assert_eq!(signed[b2 - 1], b'>', "the gap must close at the '>'");
+            assert!(signed[b1 + 1..b2 - 1].iter().all(|b| b.is_ascii_hexdigit()));
+        }
     }
 
     #[test]
@@ -1699,3 +2047,4 @@ mod manual {
         eprintln!("written /tmp/xca-signed-sample.pdf");
     }
 }
+

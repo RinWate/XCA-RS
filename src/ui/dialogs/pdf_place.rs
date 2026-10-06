@@ -2,6 +2,7 @@
 //! page preview; a click sets the stamp center, shown as a dashed ghost.
 
 use super::{error_dialog, form_dialog};
+use crate::pdf_sign::STAMP_W;
 use crate::tr;
 use gtk::prelude::*;
 use libadwaita as adw;
@@ -20,8 +21,8 @@ pub struct Placement {
     pub cy: f64,
 }
 
-/// Stamp plate size in points — mirrors the cairo plate in pdf_sign.
-pub const STAMP_W: f64 = 210.0;
+/// Stamp plate size in points — the width comes from the cairo plate in
+/// pdf_sign; the height is the approximate plate height for the ghost.
 pub const STAMP_H: f64 = 64.0;
 
 pub fn open_placement<F: Fn(Placement) + 'static>(
