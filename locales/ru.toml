@@ -192,6 +192,8 @@
 # ---- common ----
 "Error" = "Ошибка"
 "OK" = "OK"
+"Language" = "Язык"
+"System" = "Как в системе"
 "Deleted" = "Удалено"
 "This cannot be undone." = "Это действие нельзя отменить."
 "Delete “%{name}”?" = "Удалить «%{name}»?"

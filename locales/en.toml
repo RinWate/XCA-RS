@@ -190,6 +190,8 @@
 # ---- common ----
 "Error" = "Error"
 "OK" = "OK"
+"Language" = "Language"
+"System" = "System"
 "Deleted" = "Deleted"
 "This cannot be undone." = "This cannot be undone."
 "Delete “%{name}”?" = "Delete “%{name}”?"

@@ -85,6 +85,44 @@ fn bar_button(label: &str, classes: &[&str], app: &App, bar: &gtk::Box, f: impl 
     b
 }
 
+/// Native display names for the language menu; an unknown code falls back
+/// to the tag itself. Language names stay in their own language by
+/// convention — extend the map when adding a `xx.toml`.
+fn language_name(code: &str) -> String {
+    match code {
+        "en" => "English".to_string(),
+        "ru" => "Русский".to_string(),
+        "zh" => "简体中文".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Switch the UI language without restarting the process: save the choice,
+/// switch the global locale and rebuild the window over the already-open
+/// database (no password prompt again). Every label is generated with
+/// `tr!` at build time, so recreating the single window is the cheapest
+/// full re-render.
+fn switch_language(app: &App, lang: &str) {
+    crate::remember_language(lang);
+    rust_i18n::set_locale(&crate::startup_locale());
+    let Some(gtk_app) = app
+        .window
+        .application()
+        .and_then(|a| a.downcast::<adw::Application>().ok())
+    else {
+        return;
+    };
+    for w in gtk_app.windows() {
+        w.close();
+    }
+    crate::ui::window::build(
+        &gtk_app,
+        app.db.clone(),
+        app.db_path.clone(),
+        app.password_protected,
+    );
+}
+
 fn window_action(app: &App, name: &str, f: impl Fn(&App) + 'static) {
     let act = gtk::gio::SimpleAction::new(name, None);
     let a = app.clone();
@@ -949,6 +987,34 @@ pub fn build(
     sec_db.append(Some(&tr!("New Database…")), Some("win.new-db"));
     sec_db.append(Some(&tr!("Database Password…")), Some("win.db-password"));
     menu.append_section(Some(&tr!("Database")), &sec_db);
+    // Language picker: "auto" follows the system locale; the remaining
+    // entries are the locales embedded at compile time, so a new xx.toml
+    // shows up here without code changes. Selecting rebuilds the window.
+    let sec_lang = gtk::gio::Menu::new();
+    sec_lang.append(Some(&tr!("System")), Some("win.language::auto"));
+    for code in rust_i18n::available_locales!() {
+        sec_lang.append(
+            Some(&language_name(&code)),
+            Some(&format!("win.language::{code}")),
+        );
+    }
+    menu.append_section(Some(&tr!("Language")), &sec_lang);
+    let lang_act = gtk::gio::SimpleAction::new_stateful(
+        "language",
+        Some(gtk::glib::VariantTy::STRING),
+        &crate::saved_language().to_variant(),
+    );
+    {
+        let app = app.clone();
+        lang_act.connect_activate(move |act, param| {
+            let Some(lang) = param.and_then(|p| p.str()) else {
+                return;
+            };
+            act.set_state(param.expect("string variant"));
+            switch_language(&app, lang);
+        });
+    }
+    app.window.add_action(&lang_act);
     let sec_about = gtk::gio::Menu::new();
     sec_about.append(Some(&tr!("About XCA RS")), Some("win.about"));
     menu.append_section(None, &sec_about);

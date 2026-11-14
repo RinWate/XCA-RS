@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 const APP_ID: &str = "org.xca.rs";
 
 // Translations are embedded from xca-rs/locales/*.toml at compile time
-// (rust-i18n). Keys are the English source strings, so an untranslated
-// entry simply falls back to English.
-rust_i18n::i18n!("locales");
+// (rust-i18n). Keys are the English source strings; missing entries fall
+// back to "en" (identity mapping) and then to the key itself.
+rust_i18n::i18n!("locales", fallback = "en");
 
 /// Translate a string for the current locale. Returns a String because GTK
 /// builders take owned/Into values; the key doubles as the English text.
@@ -39,18 +39,54 @@ macro_rules! tr {
     };
 }
 
-fn detect_locale() -> &'static str {
-    if let Ok(l) = std::env::var("XCA_RS_LANG") {
-        return if l.starts_with("ru") { "ru" } else { "en" };
-    }
-    let env = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default();
-    if env.starts_with("ru") || env.starts_with("RU") || env.starts_with("be") || env.starts_with("uk") {
-        "ru"
+/// Locales that have no file of their own but are understood by a close
+/// relative. Extend only when adding a language file does not cover those
+/// users (e.g. Ukrainian here falls back to Russian).
+const LANG_PROXIMITY: &[(&str, &str)] = &[("be", "ru"), ("uk", "ru")];
+
+/// Detect the UI locale from the environment. Scales to any number of
+/// languages: it matches against the locales embedded at compile time
+/// (`rust_i18n::available_locales!()`), so adding a `xx.toml` file needs no
+/// code change. Returns a lowercase hyphen-separated tag ("zh-tw"), letting
+/// rust-i18n's RFC4647 fallback chain resolve variants to their base file.
+fn detect_locale() -> String {
+    let forced = std::env::var("XCA_RS_LANG").unwrap_or_default();
+    let env = if forced.is_empty() {
+        std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default()
     } else {
-        "en"
+        forced
+    };
+    // "ru_RU.UTF-8" -> ["ru", "ru"]; "zh-Hant-TW" -> ["zh", "hant", "tw"]
+    let tags: Vec<String> = env
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .split(['_', '-'])
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect();
+    let available = rust_i18n::available_locales!();
+    let has = |tag: &str| available.iter().any(|l| l.as_ref() == tag);
+    // Full BCP-47 tag first ("zh-tw"), then the base language ("zh").
+    if tags.len() >= 2 {
+        let full = format!("{}-{}", tags[0], tags[1]);
+        if has(&full) {
+            return full;
+        }
     }
+    if let Some(base) = tags.first() {
+        if has(base) {
+            return base.clone();
+        }
+        if let Some((_, near)) = LANG_PROXIMITY.iter().find(|(l, _)| l == base) {
+            if has(near) {
+                return (*near).to_string();
+            }
+        }
+    }
+    "en".to_string()
 }
 
 // ---- last used database memory (~/.config/xca-rs/config.ini) ----
@@ -81,6 +117,40 @@ pub fn last_db() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+// ---- language choice ("auto" or a locale code) in the same config ----
+
+pub fn remember_language(lang: &str) {
+    let cfg = config_file();
+    if let Some(dir) = cfg.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let kf = glib::KeyFile::new();
+    let _ = kf.load_from_file(&cfg, glib::KeyFileFlags::NONE);
+    kf.set_string("ui", "language", lang);
+    if let Err(e) = kf.save_to_file(&cfg) {
+        eprintln!("Cannot save config: {e}");
+    }
+}
+
+/// The saved language choice; "auto" when never changed in the menu.
+pub fn saved_language() -> String {
+    let kf = glib::KeyFile::new();
+    if kf.load_from_file(config_file(), glib::KeyFileFlags::NONE).is_ok() {
+        if let Ok(s) = kf.string("ui", "language") {
+            return s.to_string();
+        }
+    }
+    "auto".to_string()
+}
+
+/// The locale to start with: the saved menu choice, else the system locale.
+pub fn startup_locale() -> String {
+    match saved_language().as_str() {
+        "auto" | "" => detect_locale(),
+        lang => lang.to_string(),
+    }
+}
+
 fn database_path() -> PathBuf {
     if let Some(p) = std::env::var_os("XCA_RS_DB") {
         return PathBuf::from(p);
@@ -98,7 +168,7 @@ fn main() {
     // RC2-encrypted PKCS#12 certbags (CryptoPro CSP exports) need the
     // legacy provider; silently no-ops when the module is absent.
     let _ = crypto::init_legacy_provider();
-    rust_i18n::set_locale(detect_locale());
+    rust_i18n::set_locale(&startup_locale());
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
@@ -139,6 +209,32 @@ mod tests {
             crate::tr!("Key “%{name}” created", name = "test"),
             "Key “test” created"
         );
-        rust_i18n::set_locale(crate::detect_locale());
+        rust_i18n::set_locale("zh");
+        assert_eq!(crate::tr!("Keys"), "密钥");
+        assert_eq!(
+            crate::tr!("Key “%{name}” created", name = "测试"),
+            "密钥“测试”已创建"
+        );
+
+        rust_i18n::set_locale(&crate::detect_locale());
+    }
+
+    #[test]
+    fn detect_locale_maps_environment() {
+        for (val, want) in [
+            ("ru_RU.UTF-8", "ru"),
+            ("be_BY.UTF-8", "ru"),   // proximity fallback
+            ("uk_UA.UTF-8", "ru"),   // proximity fallback
+            ("zh_CN.UTF-8", "zh"),
+            ("zh-Hant-TW.utf8", "zh"),
+            ("en_US.UTF-8", "en"),
+            ("pt_BR.UTF-8", "en"), // no pt file yet
+            ("C", "en"),
+        ] {
+            // SAFETY: the only test touching XCA_RS_LANG; single-threaded env use.
+            unsafe { std::env::set_var("XCA_RS_LANG", val) };
+            assert_eq!(crate::detect_locale(), want, "XCA_RS_LANG={val}");
+        }
+        unsafe { std::env::remove_var("XCA_RS_LANG") };
     }
 }
